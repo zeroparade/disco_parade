@@ -1,0 +1,24 @@
+﻿{
+    "modName":  "ZERO PARADES Voice Override",
+    "disableBepInExConsole":  true,
+    "bepInEx":  {
+                    "enabled":  true,
+                    "url":  "https://builds.bepinex.dev/projects/bepinex_be/755/BepInEx-Unity.IL2CPP-win-x64-6.0.0-be.755%2B3fab71a.zip"
+                },
+    "voicePacks":  [
+                       {
+                           "name":  "male",
+                           "enabled":  true,
+                           "required":  true,
+                           "destination":  "BepInEx/voice-overrides",
+                           "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-male.zip?download=true"
+                       },
+                       {
+                           "name":  "female",
+                           "enabled":  true,
+                           "required":  true,
+                           "destination":  "BepInEx/voice-overrides-female",
+                           "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-female.zip?download=true"
+                       }
+                   ]
+}
