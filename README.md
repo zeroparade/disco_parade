@@ -47,8 +47,9 @@ At install time it:
 
 - downloads BepInEx IL2CPP x64 if missing
 - installs/configures the voice override plugin
-- downloads male/female voice packs from the URLs in `installer/installer-config.json`
-- extracts voice packs into `BepInEx/voice-overrides` and `BepInEx/voice-overrides-female`
+- asks which configured voice packs to download
+- downloads male/female/extras voice packs from the URLs in `installer/installer-config.json`
+- extracts voice packs into `BepInEx/voice-overrides`, `BepInEx/voice-overrides-female`, and `BepInEx/voice-override-extras`
 
 Before publishing, update the voice pack URLs in `installer/installer-config.json`.
 
@@ -56,5 +57,6 @@ Before publishing, update the voice pack URLs in `installer/installer-config.jso
 
 - `F1`: toggle override voices on/off
 - `F2`: switch male/female profile
+- `F12`: toggle debug toasts for played override VO and generated missing VO
 
-When overrides are off, original game VO is allowed to play.
+The extras folder is not an F2 profile. It is searched after the active male/female profile whenever overrides are on, and is used for extra character voices and dialogue cards that originally had no VO. When overrides are off, original game VO is allowed to play.

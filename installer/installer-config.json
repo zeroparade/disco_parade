@@ -8,17 +8,30 @@
     "voicePacks":  [
                        {
                            "name":  "male",
+                           "displayName":  "male replacement voices",
                            "enabled":  true,
                            "required":  true,
+                           "selectedByDefault":  true,
                            "destination":  "BepInEx/voice-overrides",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-male.zip?download=true"
                        },
                        {
                            "name":  "female",
+                           "displayName":  "female replacement voices",
                            "enabled":  true,
                            "required":  true,
+                           "selectedByDefault":  true,
                            "destination":  "BepInEx/voice-overrides-female",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-female.zip?download=true"
+                       },
+                       {
+                           "name":  "extras",
+                           "displayName":  "extra character voices",
+                           "enabled":  true,
+                           "required":  true,
+                           "selectedByDefault":  true,
+                           "destination":  "BepInEx/voice-override-extras",
+                           "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-extras.zip?download=true"
                        }
                    ]
 }

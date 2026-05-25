@@ -13,16 +13,18 @@ using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.Networking;
 
-[BepInPlugin("spore.zeroparades.voiceoverride", "ZERO PARADES Voice Override", "0.3.8")]
+[BepInPlugin("spore.zeroparades.voiceoverride", "ZERO PARADES Voice Override", "0.3.10")]
 public class VoiceOverridePlugin : BasePlugin
 {
     internal static VoiceOverridePlugin? Instance;
     internal static string LogPath = "";
     internal static string OverrideRoot = "";
+    internal static string ExtraOverrideRoot = "";
     internal static float Volume = 1.0f;
     internal static bool OverrideEnabled = true;
     internal static bool OriginalVoiceEnabledForOverrides = false;
     internal static bool AllowOriginalOnOverrideFailure = true;
+    internal static bool DebugToastsEnabled = false;
     private static readonly HashSet<string> _silentCardIds = new(StringComparer.Ordinal);
     private static bool _silentCardIndexLoaded;
     private static ConfigEntry<bool>? _overrideEnabledEntry;
@@ -31,6 +33,7 @@ public class VoiceOverridePlugin : BasePlugin
     private static ConfigEntry<string>? _overrideProfileEntry;
     private static ConfigEntry<string>? _maleOverrideRootEntry;
     private static ConfigEntry<string>? _femaleOverrideRootEntry;
+    private static ConfigEntry<string>? _extraOverrideRootEntry;
     private static ConfigEntry<KeyCode>? _toggleOverrideKeyEntry;
     private static ConfigEntry<KeyCode>? _cycleProfileKeyEntry;
     private static string _overrideProfile = "male";
@@ -68,9 +71,10 @@ public class VoiceOverridePlugin : BasePlugin
         Directory.CreateDirectory(logDir);
         Directory.CreateDirectory(OverrideRoot);
         LogPath = Path.Combine(logDir, "voice-override.log");
-        File.AppendAllText(LogPath, $"\n=== ZERO PARADES Voice Override v0.3.8 loaded {DateTime.Now:O} ===\n");
+        File.AppendAllText(LogPath, $"\n=== ZERO PARADES Voice Override v0.3.10 loaded {DateTime.Now:O} ===\n");
         WriteLog($"OverrideRoot={OverrideRoot}");
-        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} profile={_overrideProfile} toggleOverride={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)}");
+        WriteLog($"ExtraOverrideRoot={ExtraOverrideRoot}");
+        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} debugToasts={DebugToastsEnabled} profile={_overrideProfile} toggleOverride={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} debugToast=F12");
         LoadSilentCardIndex();
         try
         {
@@ -88,7 +92,7 @@ public class VoiceOverridePlugin : BasePlugin
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "FireVOEvent", typeof(Patch_FireVOEvent), nameof(Patch_FireVOEvent.Prefix));
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "FireStopVOEvent", typeof(Patch_FireStopVOEvent), nameof(Patch_FireStopVOEvent.Prefix));
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "BeforeUpdateConversation", typeof(Patch_BeforeUpdateConversation), nameof(Patch_BeforeUpdateConversation.Prefix));
-        WriteLog("PLUGIN_READY v0.3.8");
+        WriteLog("PLUGIN_READY v0.3.10");
     }
 
     private void Patch(string typeName, string methodName, Type patchType, string patchMethod)
@@ -153,6 +157,11 @@ public class VoiceOverridePlugin : BasePlugin
             "FemaleOverrideRoot",
             "voice-overrides-female",
             "Override folder for the female profile. Relative paths are resolved under BepInEx.");
+        _extraOverrideRootEntry = Config.Bind(
+            "Profiles",
+            "ExtraOverrideRoot",
+            "voice-override-extras",
+            "Supplemental override folder used for extra character voices whenever overrides are enabled. Relative paths are resolved under BepInEx.");
         _toggleOverrideKeyEntry = Config.Bind(
             "Hotkeys",
             "ToggleOverrideKey",
@@ -183,12 +192,20 @@ public class VoiceOverridePlugin : BasePlugin
     private static void ResolveOverrideRoot()
     {
         _overrideProfile = NormalizeProfile(_overrideProfileEntry?.Value);
-        var configured = _overrideProfile == "female"
-            ? _femaleOverrideRootEntry?.Value
-            : _maleOverrideRootEntry?.Value;
-        var fallback = _overrideProfile == "female" ? "voice-overrides-female" : "voice-overrides";
+        var configured = _overrideProfile switch
+        {
+            "female" => _femaleOverrideRootEntry?.Value,
+            _ => _maleOverrideRootEntry?.Value,
+        };
+        var fallback = _overrideProfile switch
+        {
+            "female" => "voice-overrides-female",
+            _ => "voice-overrides",
+        };
         OverrideRoot = ResolveBepInExPath(configured, fallback);
+        ExtraOverrideRoot = ResolveBepInExPath(_extraOverrideRootEntry?.Value, "voice-override-extras");
         try { Directory.CreateDirectory(OverrideRoot); } catch { }
+        try { Directory.CreateDirectory(ExtraOverrideRoot); } catch { }
     }
 
     private static string ResolveBepInExPath(string? configured, string fallback)
@@ -269,21 +286,34 @@ public class VoiceOverridePlugin : BasePlugin
     {
         if (string.IsNullOrWhiteSpace(id)) return null;
         var safe = id.Replace('/', '_').Replace('\\', '_').Replace(':', '_');
-        foreach (var ext in new[] { ".wav", ".ogg" })
+        foreach (var root in EnumerateOverrideRoots())
         {
-            var direct = Path.Combine(OverrideRoot, safe + ext);
-            if (File.Exists(direct)) return direct;
-        }
-        try
-        {
-            foreach (var f in Directory.EnumerateFiles(OverrideRoot, safe + ".wav", SearchOption.AllDirectories)) return f;
-            foreach (var f in Directory.EnumerateFiles(OverrideRoot, safe + ".ogg", SearchOption.AllDirectories)) return f;
-        }
-        catch (Exception ex)
-        {
-            WriteLog($"ENUM_FAIL {id}: {ex.GetType().Name}: {ex.Message}");
+            foreach (var ext in new[] { ".wav", ".ogg" })
+            {
+                var direct = Path.Combine(root, safe + ext);
+                if (File.Exists(direct)) return direct;
+            }
+            try
+            {
+                foreach (var f in Directory.EnumerateFiles(root, safe + ".wav", SearchOption.AllDirectories)) return f;
+                foreach (var f in Directory.EnumerateFiles(root, safe + ".ogg", SearchOption.AllDirectories)) return f;
+            }
+            catch (Exception ex)
+            {
+                WriteLog($"ENUM_FAIL {id} root={root}: {ex.GetType().Name}: {ex.Message}");
+            }
         }
         return null;
+    }
+
+    private static IEnumerable<string> EnumerateOverrideRoots()
+    {
+        if (!string.IsNullOrWhiteSpace(OverrideRoot)) yield return OverrideRoot;
+        if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)
+            && !string.Equals(ExtraOverrideRoot, OverrideRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            yield return ExtraOverrideRoot;
+        }
     }
 
     private static void LoadSilentCardIndex()
@@ -294,7 +324,9 @@ public class VoiceOverridePlugin : BasePlugin
         var candidates = new[]
         {
             Path.Combine(OverrideRoot, "_silent-card-ids.txt"),
+            Path.Combine(ExtraOverrideRoot, "_silent-card-ids.txt"),
             Path.Combine(Paths.BepInExRootPath, "voice-overrides", "_silent-card-ids.txt"),
+            Path.Combine(Paths.BepInExRootPath, "voice-override-extras", "_silent-card-ids.txt"),
             Path.Combine(Paths.BepInExRootPath, "voice-overrides-silent-card-ids.txt"),
         }.Distinct().ToArray();
 
@@ -314,7 +346,6 @@ public class VoiceOverridePlugin : BasePlugin
                 }
                 _silentCardIndexLoaded = true;
                 WriteLog($"SILENT_CARD_INDEX_LOADED count={_silentCardIds.Count} path={path}");
-                return;
             }
             catch (Exception ex)
             {
@@ -322,7 +353,7 @@ public class VoiceOverridePlugin : BasePlugin
             }
         }
 
-        WriteLog("SILENT_CARD_INDEX_MISSING fallback disabled");
+        if (!_silentCardIndexLoaded) WriteLog("SILENT_CARD_INDEX_MISSING fallback disabled");
     }
 
     private static bool IsSilentCardFallbackAllowed(string id)
@@ -364,6 +395,7 @@ public class VoiceOverridePlugin : BasePlugin
         if (PlayExternal(file, id))
         {
             MarkImmediateOverride(id);
+            ShowDebugToast($"Override VO: {id}");
             WriteLog(OriginalVoiceEnabledForOverrides
                 ? $"{source} ALLOW_ORIGINAL {id}"
                 : $"{source} SKIP_ORIGINAL {id}");
@@ -434,12 +466,14 @@ public class VoiceOverridePlugin : BasePlugin
             if (_runner != null && _runner.QueueDelayedUnityAudio(file, id, CardShownFallbackDelayMs))
             {
                 WriteLog($"{source} DELAYED_OVERRIDE {id} {file}");
+                ShowDebugToast($"Missing VO: {id}");
             }
             else if (string.Equals(Path.GetExtension(file), ".wav", StringComparison.OrdinalIgnoreCase))
             {
                 WriteLog($"{source} DELAYED_FALLBACK_NATIVE {id} {file}");
                 PlayWavNative(file, id);
                 MarkImmediateOverride(id);
+                ShowDebugToast($"Missing VO: {id}");
             }
         }
         catch (Exception ex)
@@ -484,14 +518,35 @@ public class VoiceOverridePlugin : BasePlugin
 
         if (WasKeyPressed(_cycleProfileKeyEntry))
         {
-            SetOverrideProfile(_overrideProfile == "female" ? "male" : "female", "HOTKEY");
+            SetOverrideProfile(NextOverrideProfile(), "HOTKEY");
         }
+
+        if (WasKeyPressed(KeyCode.F12))
+        {
+            SetDebugToastsEnabled(!DebugToastsEnabled, "HOTKEY");
+        }
+    }
+
+    private static string NextOverrideProfile()
+    {
+        return _overrideProfile switch
+        {
+            "male" => "female",
+            _ => "male",
+        };
     }
 
     private static bool WasKeyPressed(ConfigEntry<KeyCode>? entry)
     {
         if (entry == null || entry.Value == KeyCode.None) return false;
         try { return Input.GetKeyDown(entry.Value); }
+        catch { return false; }
+    }
+
+    private static bool WasKeyPressed(KeyCode key)
+    {
+        if (key == KeyCode.None) return false;
+        try { return Input.GetKeyDown(key); }
         catch { return false; }
     }
 
@@ -518,12 +573,25 @@ public class VoiceOverridePlugin : BasePlugin
         ShowToast($"Voice profile: {normalized.ToUpperInvariant()}");
     }
 
+    private static void SetDebugToastsEnabled(bool enabled, string source)
+    {
+        DebugToastsEnabled = enabled;
+        WriteLog($"OPTION_DEBUG_TOASTS {enabled} source={source}");
+        ShowToast(enabled ? "Voice debug toasts: ON" : "Voice debug toasts: OFF");
+    }
+
     internal static void ShowToast(string message)
     {
         _toastMessage = message;
         try { _toastUntilRealtime = Time.realtimeSinceStartup + 2.25f; }
         catch { _toastUntilRealtime = 0f; }
         WriteLog($"TOAST {message}");
+    }
+
+    private static void ShowDebugToast(string message)
+    {
+        if (!DebugToastsEnabled) return;
+        ShowToast(message);
     }
 
     internal static void DrawToast()

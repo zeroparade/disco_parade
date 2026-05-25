@@ -172,6 +172,76 @@ function Read-InstallerConfig {
     return (Get-Content -LiteralPath $PathValue -Raw -Encoding UTF8 | ConvertFrom-Json)
 }
 
+function Get-EnabledVoicePacks {
+    param([object] $Config)
+
+    if ($null -eq $Config.voicePacks) { return @() }
+    return @($Config.voicePacks | Where-Object {
+        -not ($_.PSObject.Properties.Name -contains "enabled") -or [bool]$_.enabled
+    })
+}
+
+function Get-VoicePackDisplayName {
+    param([object] $Pack)
+
+    $displayName = ""
+    if ($Pack.PSObject.Properties.Name -contains "displayName") {
+        $displayName = [string]$Pack.displayName
+    }
+    if ([string]::IsNullOrWhiteSpace($displayName)) {
+        $displayName = [string]$Pack.name
+    }
+    if ([string]::IsNullOrWhiteSpace($displayName)) {
+        $displayName = "voice pack"
+    }
+    return $displayName
+}
+
+function Test-VoicePackSelectedByDefault {
+    param([object] $Pack)
+
+    if ($Pack.PSObject.Properties.Name -contains "selectedByDefault") {
+        return [bool]$Pack.selectedByDefault
+    }
+    return $true
+}
+
+function Select-VoicePacksForDownload {
+    param([object[]] $VoicePacks)
+
+    if ($VoicePacks.Count -eq 0) { return @() }
+
+    Write-Host ""
+    Write-Host "Choose voice packs to download. Press Enter to keep the default."
+    Write-Host "You can rerun Install.bat later to add packs."
+
+    $selected = New-Object System.Collections.Generic.List[object]
+    foreach ($pack in $VoicePacks) {
+        $displayName = Get-VoicePackDisplayName -Pack $pack
+        $selectedByDefault = Test-VoicePackSelectedByDefault -Pack $pack
+        $suffix = if ($selectedByDefault) { "[Y/n]" } else { "[y/N]" }
+        $answer = Read-Host "Download $displayName $suffix"
+
+        $wanted = $selectedByDefault
+        if (-not [string]::IsNullOrWhiteSpace($answer)) {
+            $wanted = ($answer.Trim() -match "^(y|yes)$")
+        }
+
+        if ($wanted) {
+            $selected.Add($pack) | Out-Null
+        }
+    }
+
+    if ($selected.Count -eq 0) {
+        Write-InstallLog "No voice packs selected for download."
+    } else {
+        $selectedNames = @($selected.ToArray() | ForEach-Object { Get-VoicePackDisplayName -Pack $_ })
+        Write-InstallLog "Selected voice packs: $($selectedNames -join ', ')"
+    }
+
+    return @($selected.ToArray())
+}
+
 function Copy-DirectoryContents {
     param(
         [string] $Source,
@@ -279,6 +349,7 @@ function Ensure-PluginConfig {
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "OverrideProfile" -Value "male"
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "MaleOverrideRoot" -Value "voice-overrides"
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "FemaleOverrideRoot" -Value "voice-overrides-female"
+    Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "ExtraOverrideRoot" -Value "voice-override-extras"
     Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "OverrideEnabled" -Value "true"
     Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "OriginalVoiceEnabledWhenOverrideExists" -Value "false"
     Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "AllowOriginalVoiceWhenOverrideFails" -Value "true"
@@ -305,7 +376,7 @@ function Normalize-VoiceFileNames {
                     $renamed++
                 }
             }
-        } elseif ($base -match "^\d{3,}_(.+)$") {
+        } elseif ($base -match "^\d{5,}_(.+)$") {
             $dialogueId = $Matches[1]
             if (-not [string]::IsNullOrWhiteSpace($dialogueId)) {
                 $target = Join-Path $_.DirectoryName ($dialogueId + $_.Extension.ToLowerInvariant())
@@ -515,6 +586,7 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/plugins") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-overrides") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-overrides-female") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-override-extras") | Out-Null
 
     $pluginPath = Join-Path $GameDir "BepInEx/plugins/ZeroParadesVoiceOverride.dll"
     if (-not (Test-Path -LiteralPath $pluginPath)) {
@@ -532,15 +604,19 @@ try {
     }
 
     if (-not $SkipVoiceDownload) {
-        foreach ($pack in @($config.voicePacks)) {
+        $selectedVoicePacks = Select-VoicePacksForDownload -VoicePacks (Get-EnabledVoicePacks -Config $config)
+        foreach ($pack in $selectedVoicePacks) {
             Install-VoicePack -Pack $pack -GameRoot $GameDir
         }
+    } else {
+        Write-InstallLog "Voice pack downloads skipped by command line."
     }
 
     $maleCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-overrides") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
     $femaleCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-overrides-female") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
+    $extraCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-override-extras") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
 
-    $message = "Installed ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`n`nF1 toggles overrides. F2 switches voice profile."
+    $message = "Installed ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`nExtra character voices: $extraCount`n`nF1 toggles overrides. F2 switches male/female profile. F12 toggles debug toasts."
     Write-InstallLog $message.Replace("`n", " ")
     Close-InstallerProgress
     Show-InstallerMessage -Message $message
