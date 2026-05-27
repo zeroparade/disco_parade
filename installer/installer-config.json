@@ -32,6 +32,15 @@
                            "selectedByDefault":  true,
                            "destination":  "BepInEx/voice-override-extras",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-extras.zip?download=true"
+                       },
+                       {
+                           "name":  "narrator",
+                           "displayName":  "narrator missing voices",
+                           "enabled":  true,
+                           "required":  true,
+                           "selectedByDefault":  true,
+                           "destination":  "BepInEx/voice-override-narrator",
+                           "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-narrator.zip?download=true"
                        }
                    ]
 }

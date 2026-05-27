@@ -48,15 +48,23 @@ At install time it:
 - downloads BepInEx IL2CPP x64 if missing
 - installs/configures the voice override plugin
 - asks which configured voice packs to download
-- downloads male/female/extras voice packs from the URLs in `installer/installer-config.json`
-- extracts voice packs into `BepInEx/voice-overrides`, `BepInEx/voice-overrides-female`, and `BepInEx/voice-override-extras`
+- downloads male/female/extras/narrator voice packs from the URLs in `installer/installer-config.json`
+- extracts voice packs into `BepInEx/voice-overrides`, `BepInEx/voice-overrides-female`, `BepInEx/voice-override-extras`, and `BepInEx/voice-override-narrator`
+- records installed voice-pack metadata in `BepInEx/config/spore.zeroparades.voicepacks.json`
+- checks configured remote pack metadata on later installer runs and marks packs as up to date, update available, untracked, or check unavailable
 
-Before publishing, update the voice pack URLs in `installer/installer-config.json`.
+Before publishing, update the voice pack URLs in `installer/installer-config.json`. If a pack's Git/raw update-check URL should differ from its download URL, add `updateUrl`; otherwise the installer checks the download URL.
 
 ## Controls
 
-- `F1`: toggle override voices on/off
-- `F2`: switch male/female profile
+- `F1`: cycle presets: original game VO, original + missing VO, male redub, female redub
+- `F2`: cycle redub profile: off, male, female
+- `F3`: toggle extra-character missing VO
+- `F4`: toggle narrator-only missing VO
+- `F10`: show the latest captured dialogue report and write `ZERO_PARADES_latest_dialogue_report.txt` in the game folder for sharing
+- `F11`: toggle recurring voice-pack update toasts
 - `F12`: toggle debug toasts for played override VO and generated missing VO
 
-The extras folder is not an F2 profile. It is searched after the active male/female profile whenever overrides are on, and is used for extra character voices and dialogue cards that originally had no VO. When overrides are off, original game VO is allowed to play.
+The extras and narrator folders are not F2 profiles. Existing game VO is replaced only by the active male/female redub profile. Missing/silent dialogue searches `voice-override-narrator` first when enabled, then `voice-override-extras`, then the active redub profile for cards listed in a silent-card index.
+
+At game launch, the plugin reads `BepInEx/config/spore.zeroparades.voicepacks.json` and checks tracked voice pack URLs on a background thread. If remote metadata has changed, it shows a bottom-screen update toast and repeats it every `VoicePackUpdateToastRepeatMinutes` while update toasts are enabled.

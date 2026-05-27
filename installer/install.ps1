@@ -206,21 +206,264 @@ function Test-VoicePackSelectedByDefault {
     return $true
 }
 
+function Get-VoicePackName {
+    param([object] $Pack)
+
+    $name = [string]$Pack.name
+    if ([string]::IsNullOrWhiteSpace($name)) { return "voice-pack" }
+    return $name
+}
+
+function Get-VoicePackUpdateUrl {
+    param([object] $Pack)
+
+    if ($Pack.PSObject.Properties.Name -contains "updateUrl") {
+        $updateUrl = [string]$Pack.updateUrl
+        if (-not [string]::IsNullOrWhiteSpace($updateUrl)) { return $updateUrl }
+    }
+    return [string]$Pack.url
+}
+
+function Get-VoicePackStatePath {
+    param([string] $GameRoot)
+    return Join-Path $GameRoot "BepInEx/config/spore.zeroparades.voicepacks.json"
+}
+
+function Set-ObjectProperty {
+    param(
+        [object] $Object,
+        [string] $Name,
+        [object] $Value
+    )
+
+    if ($Object.PSObject.Properties.Name -contains $Name) {
+        $Object.PSObject.Properties[$Name].Value = $Value
+    } else {
+        $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
+    }
+}
+
+function Read-VoicePackState {
+    param([string] $GameRoot)
+
+    $path = Get-VoicePackStatePath -GameRoot $GameRoot
+    if (Test-Path -LiteralPath $path) {
+        try {
+            $state = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -eq $state) { throw "empty state" }
+            if (-not ($state.PSObject.Properties.Name -contains "packs") -or $null -eq $state.packs) {
+                Set-ObjectProperty -Object $state -Name "packs" -Value ([pscustomobject]@{})
+            }
+            return $state
+        } catch {
+            Write-InstallLog "Voice pack state could not be read; starting fresh: $($_.Exception.Message)"
+        }
+    }
+
+    return [pscustomobject]@{
+        schemaVersion = 1
+        updatedAt = ""
+        packs = [pscustomobject]@{}
+    }
+}
+
+function Save-VoicePackState {
+    param(
+        [string] $GameRoot,
+        [object] $State
+    )
+
+    $path = Get-VoicePackStatePath -GameRoot $GameRoot
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    Set-ObjectProperty -Object $State -Name "schemaVersion" -Value 1
+    Set-ObjectProperty -Object $State -Name "updatedAt" -Value ((Get-Date).ToUniversalTime().ToString("o"))
+    if (-not ($State.PSObject.Properties.Name -contains "packs") -or $null -eq $State.packs) {
+        Set-ObjectProperty -Object $State -Name "packs" -Value ([pscustomobject]@{})
+    }
+    $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path -Encoding UTF8
+}
+
+function Get-VoicePackStateEntry {
+    param(
+        [object] $State,
+        [string] $Name
+    )
+
+    if ($null -eq $State -or $null -eq $State.packs) { return $null }
+    if ($State.packs.PSObject.Properties.Name -contains $Name) {
+        return $State.packs.PSObject.Properties[$Name].Value
+    }
+    return $null
+}
+
+function Get-RemoteVoicePackMetadata {
+    param(
+        [string] $Url,
+        [string] $DisplayName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url) -or $Url.Contains("YOUR_NAME/YOUR_REPO")) {
+        return [pscustomobject]@{ ok = $false; error = "no URL configured" }
+    }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $request = $null
+    $response = $null
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($Url)
+        $request.Method = "HEAD"
+        $request.UserAgent = "ZeroParadesVoiceOverrideInstaller/1.0"
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = 15000
+        $request.ReadWriteTimeout = 30000
+        $response = $request.GetResponse()
+        $lastModified = ""
+        try {
+            if ($response.LastModified -gt [DateTime]::MinValue) {
+                $lastModified = $response.LastModified.ToUniversalTime().ToString("o")
+            }
+        } catch { }
+
+        return [pscustomobject]@{
+            ok = $true
+            url = $Url
+            etag = [string]$response.Headers["ETag"]
+            lastModified = $lastModified
+            contentLength = [Int64]$response.ContentLength
+            checkedAt = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    } catch {
+        Write-InstallLog "Voice pack update check unavailable for '$DisplayName': $($_.Exception.GetType().Name): $($_.Exception.Message)"
+        return [pscustomobject]@{
+            ok = $false
+            url = $Url
+            error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+            checkedAt = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    } finally {
+        if ($response -ne $null) { $response.Dispose() }
+    }
+}
+
+function Test-RemoteMetadataChanged {
+    param(
+        [object] $Remote,
+        [object] $Installed
+    )
+
+    if ($null -eq $Remote -or $null -eq $Installed -or $Remote.ok -ne $true) { return $false }
+
+    $remoteEtag = [string]$Remote.etag
+    $installedEtag = [string]$Installed.etag
+    if ((-not [string]::IsNullOrWhiteSpace($remoteEtag)) -and
+        (-not [string]::IsNullOrWhiteSpace($installedEtag)) -and
+        ($remoteEtag -ne $installedEtag)) {
+        return $true
+    }
+
+    $remoteLength = [Int64]$Remote.contentLength
+    $installedLength = [Int64]$Installed.contentLength
+    if ($remoteLength -gt 0 -and $installedLength -gt 0 -and $remoteLength -ne $installedLength) {
+        return $true
+    }
+
+    $remoteModified = [string]$Remote.lastModified
+    $installedModified = [string]$Installed.lastModified
+    if ((-not [string]::IsNullOrWhiteSpace($remoteModified)) -and
+        (-not [string]::IsNullOrWhiteSpace($installedModified)) -and
+        ($remoteModified -ne $installedModified)) {
+        return $true
+    }
+
+    return $false
+}
+
+function Get-VoicePackInstallStatus {
+    param(
+        [object] $Pack,
+        [string] $GameRoot,
+        [object] $State
+    )
+
+    $name = Get-VoicePackName -Pack $Pack
+    $displayName = Get-VoicePackDisplayName -Pack $Pack
+    $destinationRelative = [string]$Pack.destination
+    $destination = if ([string]::IsNullOrWhiteSpace($destinationRelative)) { "" } else { Join-Path $GameRoot $destinationRelative }
+    $wavCount = 0
+    if (-not [string]::IsNullOrWhiteSpace($destination) -and (Test-Path -LiteralPath $destination)) {
+        $wavCount = @(Get-ChildItem -LiteralPath $destination -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
+    }
+
+    $installed = Get-VoicePackStateEntry -State $State -Name $name
+    $remote = Get-RemoteVoicePackMetadata -Url (Get-VoicePackUpdateUrl -Pack $Pack) -DisplayName $displayName
+
+    $status = "not-installed"
+    $statusText = "not installed"
+    if ($wavCount -gt 0) {
+        if ($remote.ok -ne $true) {
+            $status = "check-unavailable"
+            $statusText = "installed, update check unavailable, $wavCount wavs"
+        } elseif ($null -eq $installed) {
+            $status = "untracked"
+            $statusText = "installed but not tracked yet, $wavCount wavs"
+        } elseif (Test-RemoteMetadataChanged -Remote $remote -Installed $installed) {
+            $status = "update-available"
+            $statusText = "update available, $wavCount installed wavs"
+        } else {
+            $status = "current"
+            $statusText = "up to date, $wavCount wavs"
+        }
+    }
+
+    return [pscustomobject]@{
+        name = $name
+        displayName = $displayName
+        status = $status
+        statusText = $statusText
+        wavCount = $wavCount
+        remote = $remote
+        installed = $installed
+    }
+}
+
+function Test-VoicePackDownloadDefault {
+    param(
+        [object] $Pack,
+        [object] $Status
+    )
+
+    if ($Status.status -eq "current" -or $Status.status -eq "check-unavailable") {
+        return $false
+    }
+    if ($Status.status -eq "update-available" -or $Status.status -eq "untracked") {
+        return $true
+    }
+    return (Test-VoicePackSelectedByDefault -Pack $Pack)
+}
+
 function Select-VoicePacksForDownload {
-    param([object[]] $VoicePacks)
+    param(
+        [object[]] $VoicePacks,
+        [string] $GameRoot
+    )
 
     if ($VoicePacks.Count -eq 0) { return @() }
 
     Write-Host ""
-    Write-Host "Choose voice packs to download. Press Enter to keep the default."
+    Write-Host "Checking voice pack update metadata..."
+    $state = Read-VoicePackState -GameRoot $GameRoot
+
+    Write-Host ""
+    Write-Host "Choose voice packs to download or update. Press Enter to keep the default."
     Write-Host "You can rerun Install.bat later to add packs."
 
     $selected = New-Object System.Collections.Generic.List[object]
     foreach ($pack in $VoicePacks) {
         $displayName = Get-VoicePackDisplayName -Pack $pack
-        $selectedByDefault = Test-VoicePackSelectedByDefault -Pack $pack
+        $status = Get-VoicePackInstallStatus -Pack $pack -GameRoot $GameRoot -State $state
+        $selectedByDefault = Test-VoicePackDownloadDefault -Pack $pack -Status $status
         $suffix = if ($selectedByDefault) { "[Y/n]" } else { "[y/N]" }
-        $answer = Read-Host "Download $displayName $suffix"
+        $answer = Read-Host "Download $displayName ($($status.statusText)) $suffix"
 
         $wanted = $selectedByDefault
         if (-not [string]::IsNullOrWhiteSpace($answer)) {
@@ -346,13 +589,22 @@ function Ensure-PluginConfig {
     $voiceConfig = Join-Path $configDir "spore.zeroparades.voiceoverride.cfg"
     Set-IniValue -Path $voiceConfig -Section "Hotkeys" -Key "ToggleOverrideKey" -Value "F1"
     Set-IniValue -Path $voiceConfig -Section "Hotkeys" -Key "CycleProfileKey" -Value "F2"
+    Set-IniValue -Path $voiceConfig -Section "Hotkeys" -Key "ToggleExtraVoicesKey" -Value "F3"
+    Set-IniValue -Path $voiceConfig -Section "Hotkeys" -Key "ToggleNarratorMissingVoicesKey" -Value "F4"
+    Set-IniValue -Path $voiceConfig -Section "Hotkeys" -Key "ReportLatestDialogueKey" -Value "F10"
+    Set-IniValue -Path $voiceConfig -Section "Hotkeys" -Key "ToggleVoicePackUpdateToastsKey" -Value "F11"
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "OverrideProfile" -Value "male"
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "MaleOverrideRoot" -Value "voice-overrides"
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "FemaleOverrideRoot" -Value "voice-overrides-female"
     Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "ExtraOverrideRoot" -Value "voice-override-extras"
+    Set-IniValue -Path $voiceConfig -Section "Profiles" -Key "NarratorOverrideRoot" -Value "voice-override-narrator"
     Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "OverrideEnabled" -Value "true"
+    Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "ExtraVoicesEnabled" -Value "true"
+    Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "NarratorMissingVoicesEnabled" -Value "false"
     Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "OriginalVoiceEnabledWhenOverrideExists" -Value "false"
     Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "AllowOriginalVoiceWhenOverrideFails" -Value "true"
+    Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "VoicePackUpdateToastsEnabled" -Value "true"
+    Set-IniValue -Path $voiceConfig -Section "Runtime" -Key "VoicePackUpdateToastRepeatMinutes" -Value "30"
 }
 
 function Normalize-VoiceFileNames {
@@ -418,13 +670,23 @@ function Download-File {
     $response = $null
     $inputStream = $null
     $outputStream = $null
+    $downloaded = [Int64]0
+    $etag = ""
+    $lastModified = ""
+    $contentLength = [Int64]-1
     try {
         $response = $request.GetResponse()
-        $totalBytes = [Int64]$response.ContentLength
+        $etag = [string]$response.Headers["ETag"]
+        try {
+            if ($response.LastModified -gt [DateTime]::MinValue) {
+                $lastModified = $response.LastModified.ToUniversalTime().ToString("o")
+            }
+        } catch { }
+        $contentLength = [Int64]$response.ContentLength
+        $totalBytes = $contentLength
         $inputStream = $response.GetResponseStream()
         $outputStream = [System.IO.File]::Create($Destination)
         $buffer = New-Object byte[] (1024 * 1024)
-        $downloaded = [Int64]0
         $startedAt = Get-Date
         $lastUpdate = Get-Date "2000-01-01"
 
@@ -456,6 +718,45 @@ function Download-File {
 
     Set-InstallerProgress -Title $activity -Status "Download complete: $(Format-ByteSize ((Get-Item -LiteralPath $Destination).Length))" -Percent 100
     Complete-InstallerProgress -Title $activity
+    return [pscustomobject]@{
+        ok = $true
+        url = $Url
+        etag = $etag
+        lastModified = $lastModified
+        contentLength = $contentLength
+        downloadedBytes = $downloaded
+        downloadedAt = (Get-Date).ToUniversalTime().ToString("o")
+    }
+}
+
+function Update-VoicePackState {
+    param(
+        [string] $GameRoot,
+        [object] $Pack,
+        [object] $DownloadMetadata,
+        [int] $WavCount,
+        [int] $RenamedCount
+    )
+
+    $name = Get-VoicePackName -Pack $Pack
+    $state = Read-VoicePackState -GameRoot $GameRoot
+    $metadata = [pscustomobject]@{
+        name = $name
+        displayName = Get-VoicePackDisplayName -Pack $Pack
+        destination = [string]$Pack.destination
+        url = [string]$Pack.url
+        updateUrl = Get-VoicePackUpdateUrl -Pack $Pack
+        installedAt = (Get-Date).ToUniversalTime().ToString("o")
+        etag = [string]$DownloadMetadata.etag
+        lastModified = [string]$DownloadMetadata.lastModified
+        contentLength = [Int64]$DownloadMetadata.contentLength
+        downloadedBytes = [Int64]$DownloadMetadata.downloadedBytes
+        wavCount = $WavCount
+        renamedCount = $RenamedCount
+    }
+    Set-ObjectProperty -Object $state.packs -Name $name -Value $metadata
+    Save-VoicePackState -GameRoot $GameRoot -State $state
+    Write-InstallLog "Recorded voice pack state for '$name' ($WavCount wav files)."
 }
 
 function Install-BepInExIfMissing {
@@ -493,7 +794,7 @@ function Install-BepInExIfMissing {
         Remove-Item -LiteralPath $archive -Force
     }
 
-    Download-File -Url $url -Destination $archive -DisplayName "BepInEx IL2CPP x64"
+    $null = Download-File -Url $url -Destination $archive -DisplayName "BepInEx IL2CPP x64"
     Set-InstallerProgress -Title "Installing BepInEx" -Status "Extracting BepInEx into the game folder..." -Percent 100
     Expand-Archive -LiteralPath $archive -DestinationPath $GameRoot -Force
     Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
@@ -517,8 +818,7 @@ function Install-VoicePack {
         return
     }
 
-    $name = [string]$Pack.name
-    if ([string]::IsNullOrWhiteSpace($name)) { $name = "voice-pack" }
+    $name = Get-VoicePackName -Pack $Pack
 
     $url = [string]$Pack.url
     $required = $false
@@ -545,7 +845,7 @@ function Install-VoicePack {
         Remove-Item -LiteralPath $archive -Force
     }
 
-    Download-File -Url $url -Destination $archive -DisplayName "$name voice pack"
+    $downloadMetadata = Download-File -Url $url -Destination $archive -DisplayName "$name voice pack"
     Set-InstallerProgress -Title "Installing $name voice pack" -Status "Extracting into $destinationRelative..." -Percent 100
     Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
     Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
@@ -563,6 +863,7 @@ function Install-VoicePack {
     $script:RenamedVoiceFiles = 0
     Normalize-VoiceFileNames -Directory $destination | Out-Null
     $wavCount = @(Get-ChildItem -LiteralPath $destination -Filter "*.wav" -File -Recurse).Count
+    Update-VoicePackState -GameRoot $GameRoot -Pack $Pack -DownloadMetadata $downloadMetadata -WavCount $wavCount -RenamedCount $script:RenamedVoiceFiles
     Write-InstallLog "Installed voice pack '$name' to '$destinationRelative' ($wavCount wav files, $script:RenamedVoiceFiles renamed)."
 }
 
@@ -587,6 +888,7 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-overrides") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-overrides-female") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-override-extras") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-override-narrator") | Out-Null
 
     $pluginPath = Join-Path $GameDir "BepInEx/plugins/ZeroParadesVoiceOverride.dll"
     if (-not (Test-Path -LiteralPath $pluginPath)) {
@@ -604,7 +906,7 @@ try {
     }
 
     if (-not $SkipVoiceDownload) {
-        $selectedVoicePacks = Select-VoicePacksForDownload -VoicePacks (Get-EnabledVoicePacks -Config $config)
+        $selectedVoicePacks = Select-VoicePacksForDownload -VoicePacks (Get-EnabledVoicePacks -Config $config) -GameRoot $GameDir
         foreach ($pack in $selectedVoicePacks) {
             Install-VoicePack -Pack $pack -GameRoot $GameDir
         }
@@ -615,8 +917,9 @@ try {
     $maleCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-overrides") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
     $femaleCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-overrides-female") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
     $extraCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-override-extras") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
+    $narratorCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-override-narrator") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
 
-    $message = "Installed ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`nExtra character voices: $extraCount`n`nF1 toggles overrides. F2 switches male/female profile. F12 toggles debug toasts."
+    $message = "Installed ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`nExtra character voices: $extraCount`nNarrator missing voices: $narratorCount`n`nF1 cycles presets. F2 cycles redub off/male/female. F3 toggles extras. F4 toggles narrator missing VO. F10 reports latest dialogue. F11 toggles update toasts. F12 toggles debug toasts."
     Write-InstallLog $message.Replace("`n", " ")
     Close-InstallerProgress
     Show-InstallerMessage -Message $message

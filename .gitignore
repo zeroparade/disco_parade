@@ -1,0 +1,11 @@
+bin/
+obj/
+**/bin/
+**/obj/
+*.user
+*.suo
+*.log
+*.tmp
+*.cache
+*.deps.json
+*.pdb

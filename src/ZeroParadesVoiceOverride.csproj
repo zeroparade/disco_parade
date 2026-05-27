@@ -23,6 +23,7 @@
     <Reference Include="Il2Cppmscorlib" HintPath="$(BepInExDir)\interop\Il2Cppmscorlib.dll" Private="false" />
     <Reference Include="UnityEngine.CoreModule" HintPath="$(BepInExDir)\interop\UnityEngine.CoreModule.dll" Private="false" />
     <Reference Include="UnityEngine.IMGUIModule" HintPath="$(BepInExDir)\interop\UnityEngine.IMGUIModule.dll" Private="false" />
+    <Reference Include="UnityEngine.TextRenderingModule" HintPath="$(BepInExDir)\interop\UnityEngine.TextRenderingModule.dll" Private="false" />
     <Reference Include="UnityEngine.InputLegacyModule" HintPath="$(BepInExDir)\interop\UnityEngine.InputLegacyModule.dll" Private="false" />
     <Reference Include="UnityEngine.AudioModule" HintPath="$(BepInExDir)\interop\UnityEngine.AudioModule.dll" Private="false" />
     <Reference Include="UnityEngine.UnityWebRequestModule" HintPath="$(BepInExDir)\interop\UnityEngine.UnityWebRequestModule.dll" Private="false" />

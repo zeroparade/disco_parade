@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
@@ -13,29 +14,42 @@ using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.Networking;
 
-[BepInPlugin("spore.zeroparades.voiceoverride", "ZERO PARADES Voice Override", "0.3.10")]
+[BepInPlugin("spore.zeroparades.voiceoverride", "ZERO PARADES Voice Override", "0.3.15")]
 public class VoiceOverridePlugin : BasePlugin
 {
     internal static VoiceOverridePlugin? Instance;
     internal static string LogPath = "";
     internal static string OverrideRoot = "";
     internal static string ExtraOverrideRoot = "";
+    internal static string NarratorOverrideRoot = "";
     internal static float Volume = 1.0f;
     internal static bool OverrideEnabled = true;
+    internal static bool ExtraVoicesEnabled = true;
+    internal static bool NarratorMissingVoicesEnabled = false;
     internal static bool OriginalVoiceEnabledForOverrides = false;
     internal static bool AllowOriginalOnOverrideFailure = true;
     internal static bool DebugToastsEnabled = false;
+    internal static bool VoicePackUpdateToastsEnabled = true;
     private static readonly HashSet<string> _silentCardIds = new(StringComparer.Ordinal);
     private static bool _silentCardIndexLoaded;
     private static ConfigEntry<bool>? _overrideEnabledEntry;
+    private static ConfigEntry<bool>? _extraVoicesEnabledEntry;
+    private static ConfigEntry<bool>? _narratorMissingVoicesEnabledEntry;
     private static ConfigEntry<bool>? _originalVoiceEnabledEntry;
     private static ConfigEntry<bool>? _allowOriginalOnOverrideFailureEntry;
+    private static ConfigEntry<bool>? _voicePackUpdateToastsEnabledEntry;
+    private static ConfigEntry<int>? _voicePackUpdateToastRepeatMinutesEntry;
     private static ConfigEntry<string>? _overrideProfileEntry;
     private static ConfigEntry<string>? _maleOverrideRootEntry;
     private static ConfigEntry<string>? _femaleOverrideRootEntry;
     private static ConfigEntry<string>? _extraOverrideRootEntry;
+    private static ConfigEntry<string>? _narratorOverrideRootEntry;
     private static ConfigEntry<KeyCode>? _toggleOverrideKeyEntry;
     private static ConfigEntry<KeyCode>? _cycleProfileKeyEntry;
+    private static ConfigEntry<KeyCode>? _toggleExtraVoicesKeyEntry;
+    private static ConfigEntry<KeyCode>? _toggleNarratorMissingVoicesKeyEntry;
+    private static ConfigEntry<KeyCode>? _reportLatestDialogueKeyEntry;
+    private static ConfigEntry<KeyCode>? _toggleVoicePackUpdateToastsKeyEntry;
     private static string _overrideProfile = "male";
     private static string _toastMessage = "";
     private static float _toastUntilRealtime;
@@ -51,6 +65,16 @@ public class VoiceOverridePlugin : BasePlugin
     private static readonly Dictionary<string, DateTime> _recentImmediateOverridesUtc = new();
     private static readonly Dictionary<string, DateTime> _recentCardShownQueuesUtc = new();
     private static int _dialogueStopGeneration;
+    private static readonly object _voicePackUpdateLock = new();
+    private static bool _voicePackUpdateCheckRunning;
+    private static DateTime _lastVoicePackUpdateCheckUtc = DateTime.MinValue;
+    private static DateTime _nextVoicePackUpdateToastUtc = DateTime.MinValue;
+    private static string _voicePackUpdateToastMessage = "";
+    private static readonly Dictionary<string, string> _dialogueTextById = new(StringComparer.Ordinal);
+    private static string _latestDialogueId = "";
+    private static string _latestDialogueText = "";
+    private static string _latestDialogueSource = "";
+    private static DateTime _latestDialogueUtc = DateTime.MinValue;
     private static string _cardShownAppearanceId = "";
     private static int _cardShownAppearanceStopGeneration = -1;
     private static bool _cardShownAppearanceQueuedOrPlayed;
@@ -58,6 +82,8 @@ public class VoiceOverridePlugin : BasePlugin
     private static DateTime _lastShownCardUtc = DateTime.MinValue;
     private const int ImmediateDuplicateSuppressMs = 500;
     private const int CardShownFallbackDelayMs = 175;
+    private const int DefaultVoicePackUpdateToastRepeatMinutes = 30;
+    private const string LatestDialogueReportFileName = "ZERO_PARADES_latest_dialogue_report.txt";
     private const uint SND_ASYNC = 0x0001;
     private const uint SND_NODEFAULT = 0x0002;
     private const uint SND_FILENAME = 0x00020000;
@@ -69,12 +95,16 @@ public class VoiceOverridePlugin : BasePlugin
         ResolveOverrideRoot();
         var logDir = Path.Combine(Paths.BepInExRootPath, "voice-override-logs");
         Directory.CreateDirectory(logDir);
-        Directory.CreateDirectory(OverrideRoot);
+        if (!string.IsNullOrWhiteSpace(OverrideRoot)) Directory.CreateDirectory(OverrideRoot);
+        if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)) Directory.CreateDirectory(ExtraOverrideRoot);
+        if (!string.IsNullOrWhiteSpace(NarratorOverrideRoot)) Directory.CreateDirectory(NarratorOverrideRoot);
         LogPath = Path.Combine(logDir, "voice-override.log");
-        File.AppendAllText(LogPath, $"\n=== ZERO PARADES Voice Override v0.3.10 loaded {DateTime.Now:O} ===\n");
+        File.AppendAllText(LogPath, $"\n=== ZERO PARADES Voice Override v0.3.15 loaded {DateTime.Now:O} ===\n");
         WriteLog($"OverrideRoot={OverrideRoot}");
         WriteLog($"ExtraOverrideRoot={ExtraOverrideRoot}");
-        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} debugToasts={DebugToastsEnabled} profile={_overrideProfile} toggleOverride={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} debugToast=F12");
+        WriteLog($"NarratorOverrideRoot={NarratorOverrideRoot}");
+        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} extraVoices={ExtraVoicesEnabled} narratorMissingVoices={NarratorMissingVoicesEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} debugToasts={DebugToastsEnabled} updateToasts={VoicePackUpdateToastsEnabled} updateRepeatMinutes={GetVoicePackUpdateToastRepeatMinutes()} profile={_overrideProfile} presetKey={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} toggleExtras={GetConfiguredKeyName(_toggleExtraVoicesKeyEntry)} toggleNarrator={GetConfiguredKeyName(_toggleNarratorMissingVoicesKeyEntry)} reportLatest={GetConfiguredKeyName(_reportLatestDialogueKeyEntry)} updateToast=F11 debugToast=F12");
+        StartVoicePackUpdateCheck("LOAD", force: true);
         LoadSilentCardIndex();
         try
         {
@@ -92,7 +122,7 @@ public class VoiceOverridePlugin : BasePlugin
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "FireVOEvent", typeof(Patch_FireVOEvent), nameof(Patch_FireVOEvent.Prefix));
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "FireStopVOEvent", typeof(Patch_FireStopVOEvent), nameof(Patch_FireStopVOEvent.Prefix));
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "BeforeUpdateConversation", typeof(Patch_BeforeUpdateConversation), nameof(Patch_BeforeUpdateConversation.Prefix));
-        WriteLog("PLUGIN_READY v0.3.10");
+        WriteLog("PLUGIN_READY v0.3.15");
     }
 
     private void Patch(string typeName, string methodName, Type patchType, string patchMethod)
@@ -131,7 +161,17 @@ public class VoiceOverridePlugin : BasePlugin
             "Runtime",
             "OverrideEnabled",
             true,
-            "If true, external override WAV/OGG files are played when present.");
+            "Master custom voice switch. Presets and feature hotkeys update this automatically.");
+        _extraVoicesEnabledEntry = Config.Bind(
+            "Runtime",
+            "ExtraVoicesEnabled",
+            true,
+            "If true, supplemental extra-character voices are used for matching missing/silent dialogue cards.");
+        _narratorMissingVoicesEnabledEntry = Config.Bind(
+            "Runtime",
+            "NarratorMissingVoicesEnabled",
+            false,
+            "If true, narrator-only missing/silent dialogue is filled from the narrator override folder.");
         _originalVoiceEnabledEntry = Config.Bind(
             "Runtime",
             "OriginalVoiceEnabledWhenOverrideExists",
@@ -142,11 +182,21 @@ public class VoiceOverridePlugin : BasePlugin
             "AllowOriginalVoiceWhenOverrideFails",
             true,
             "If true, the game's original VO is allowed if an override file exists but cannot be played.");
+        _voicePackUpdateToastsEnabledEntry = Config.Bind(
+            "Runtime",
+            "VoicePackUpdateToastsEnabled",
+            true,
+            "If true, the mod checks installed voice-pack metadata against remote URLs and shows recurring update toasts when updates are available.");
+        _voicePackUpdateToastRepeatMinutesEntry = Config.Bind(
+            "Runtime",
+            "VoicePackUpdateToastRepeatMinutes",
+            DefaultVoicePackUpdateToastRepeatMinutes,
+            "How often to repeat the voice-pack update toast while updates are available.");
         _overrideProfileEntry = Config.Bind(
             "Profiles",
             "OverrideProfile",
             "male",
-            "Active override profile. Supported values: male, female.");
+            "Active redub profile. Supported values: off, male, female.");
         _maleOverrideRootEntry = Config.Bind(
             "Profiles",
             "MaleOverrideRoot",
@@ -161,30 +211,59 @@ public class VoiceOverridePlugin : BasePlugin
             "Profiles",
             "ExtraOverrideRoot",
             "voice-override-extras",
-            "Supplemental override folder used for extra character voices whenever overrides are enabled. Relative paths are resolved under BepInEx.");
+            "Supplemental override folder used for extra character voices. Relative paths are resolved under BepInEx.");
+        _narratorOverrideRootEntry = Config.Bind(
+            "Profiles",
+            "NarratorOverrideRoot",
+            "voice-override-narrator",
+            "Supplemental override folder used for narrator-only missing dialogue. Relative paths are resolved under BepInEx.");
         _toggleOverrideKeyEntry = Config.Bind(
             "Hotkeys",
             "ToggleOverrideKey",
             KeyCode.F1,
-            "Runtime hotkey for toggling override playback. Set to None to disable.");
+            "Runtime hotkey for cycling voice presets. Set to None to disable.");
         _cycleProfileKeyEntry = Config.Bind(
             "Hotkeys",
             "CycleProfileKey",
             KeyCode.F2,
-            "Runtime hotkey for switching between male and female override profiles. Set to None to disable.");
+            "Runtime hotkey for switching redub profile between off, male, and female. Set to None to disable.");
+        _toggleExtraVoicesKeyEntry = Config.Bind(
+            "Hotkeys",
+            "ToggleExtraVoicesKey",
+            KeyCode.F3,
+            "Runtime hotkey for toggling extra-character missing voices. Set to None to disable.");
+        _toggleNarratorMissingVoicesKeyEntry = Config.Bind(
+            "Hotkeys",
+            "ToggleNarratorMissingVoicesKey",
+            KeyCode.F4,
+            "Runtime hotkey for toggling narrator-only missing voices. Set to None to disable.");
+        _reportLatestDialogueKeyEntry = Config.Bind(
+            "Hotkeys",
+            "ReportLatestDialogueKey",
+            KeyCode.F10,
+            "Runtime hotkey for showing and writing the latest captured dialogue report. Set to None to disable.");
+        _toggleVoicePackUpdateToastsKeyEntry = Config.Bind(
+            "Hotkeys",
+            "ToggleVoicePackUpdateToastsKey",
+            KeyCode.F11,
+            "Runtime hotkey for toggling recurring voice-pack update toasts. Set to None to disable.");
 
         if (_toggleOverrideKeyEntry.Value == KeyCode.F8) _toggleOverrideKeyEntry.Value = KeyCode.F1;
         if (_cycleProfileKeyEntry.Value == KeyCode.F10) _cycleProfileKeyEntry.Value = KeyCode.F2;
 
         OverrideEnabled = _overrideEnabledEntry.Value;
+        ExtraVoicesEnabled = _extraVoicesEnabledEntry.Value;
+        NarratorMissingVoicesEnabled = _narratorMissingVoicesEnabledEntry.Value;
         OriginalVoiceEnabledForOverrides = _originalVoiceEnabledEntry.Value;
         AllowOriginalOnOverrideFailure = _allowOriginalOnOverrideFailureEntry.Value;
+        VoicePackUpdateToastsEnabled = _voicePackUpdateToastsEnabledEntry.Value;
         _overrideProfile = NormalizeProfile(_overrideProfileEntry.Value);
         _overrideProfileEntry.Value = _overrideProfile;
     }
 
     private static string NormalizeProfile(string? profile)
     {
+        if (string.Equals(profile, "off", StringComparison.OrdinalIgnoreCase)) return "off";
         if (string.Equals(profile, "female", StringComparison.OrdinalIgnoreCase)) return "female";
         return "male";
     }
@@ -192,20 +271,29 @@ public class VoiceOverridePlugin : BasePlugin
     private static void ResolveOverrideRoot()
     {
         _overrideProfile = NormalizeProfile(_overrideProfileEntry?.Value);
-        var configured = _overrideProfile switch
+        if (string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase))
         {
-            "female" => _femaleOverrideRootEntry?.Value,
-            _ => _maleOverrideRootEntry?.Value,
-        };
-        var fallback = _overrideProfile switch
+            OverrideRoot = "";
+        }
+        else
         {
-            "female" => "voice-overrides-female",
-            _ => "voice-overrides",
-        };
-        OverrideRoot = ResolveBepInExPath(configured, fallback);
+            var configured = _overrideProfile switch
+            {
+                "female" => _femaleOverrideRootEntry?.Value,
+                _ => _maleOverrideRootEntry?.Value,
+            };
+            var fallback = _overrideProfile switch
+            {
+                "female" => "voice-overrides-female",
+                _ => "voice-overrides",
+            };
+            OverrideRoot = ResolveBepInExPath(configured, fallback);
+        }
         ExtraOverrideRoot = ResolveBepInExPath(_extraOverrideRootEntry?.Value, "voice-override-extras");
-        try { Directory.CreateDirectory(OverrideRoot); } catch { }
-        try { Directory.CreateDirectory(ExtraOverrideRoot); } catch { }
+        NarratorOverrideRoot = ResolveBepInExPath(_narratorOverrideRootEntry?.Value, "voice-override-narrator");
+        try { if (!string.IsNullOrWhiteSpace(OverrideRoot)) Directory.CreateDirectory(OverrideRoot); } catch { }
+        try { if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)) Directory.CreateDirectory(ExtraOverrideRoot); } catch { }
+        try { if (!string.IsNullOrWhiteSpace(NarratorOverrideRoot)) Directory.CreateDirectory(NarratorOverrideRoot); } catch { }
     }
 
     private static string ResolveBepInExPath(string? configured, string fallback)
@@ -218,6 +306,316 @@ public class VoiceOverridePlugin : BasePlugin
     private static string GetConfiguredKeyName(ConfigEntry<KeyCode>? entry)
     {
         return entry == null ? "<unset>" : entry.Value.ToString();
+    }
+
+    private static int GetVoicePackUpdateToastRepeatMinutes()
+    {
+        var configured = _voicePackUpdateToastRepeatMinutesEntry?.Value ?? DefaultVoicePackUpdateToastRepeatMinutes;
+        return Math.Max(5, configured);
+    }
+
+    private static void StartVoicePackUpdateCheck(string source, bool force)
+    {
+        if (!VoicePackUpdateToastsEnabled)
+        {
+            WriteLog($"VOICE_PACK_UPDATE_CHECK_DISABLED source={source}");
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        var repeatMinutes = GetVoicePackUpdateToastRepeatMinutes();
+        lock (_voicePackUpdateLock)
+        {
+            if (_voicePackUpdateCheckRunning) return;
+            if (!force
+                && _lastVoicePackUpdateCheckUtc != DateTime.MinValue
+                && (now - _lastVoicePackUpdateCheckUtc).TotalMinutes < repeatMinutes)
+            {
+                return;
+            }
+
+            _voicePackUpdateCheckRunning = true;
+            _lastVoicePackUpdateCheckUtc = now;
+        }
+
+        try
+        {
+            var thread = new System.Threading.Thread(() => RunVoicePackUpdateCheck(source))
+            {
+                IsBackground = true,
+                Name = "ZeroParadesVoicePackUpdateCheck",
+            };
+            thread.Start();
+            WriteLog($"VOICE_PACK_UPDATE_CHECK_STARTED source={source}");
+        }
+        catch (Exception ex)
+        {
+            lock (_voicePackUpdateLock) _voicePackUpdateCheckRunning = false;
+            WriteLog($"VOICE_PACK_UPDATE_CHECK_START_FAIL {source}: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void RunVoicePackUpdateCheck(string source)
+    {
+        try
+        {
+            var installedPacks = LoadInstalledVoicePackStates();
+            if (installedPacks.Count == 0)
+            {
+                WriteLog($"VOICE_PACK_UPDATE_STATE_EMPTY source={source}");
+                lock (_voicePackUpdateLock)
+                {
+                    _voicePackUpdateToastMessage = "";
+                    _voicePackUpdateCheckRunning = false;
+                }
+                return;
+            }
+
+            var changed = new List<string>();
+            foreach (var pack in installedPacks)
+            {
+                try
+                {
+                    if (string.IsNullOrWhiteSpace(pack.UpdateUrl))
+                    {
+                        WriteLog($"VOICE_PACK_UPDATE_SKIP_NO_URL {pack.Name}");
+                        continue;
+                    }
+
+                    var remote = GetRemoteVoicePackMetadata(pack.UpdateUrl);
+                    if (remote == null)
+                    {
+                        WriteLog($"VOICE_PACK_UPDATE_CHECK_UNAVAILABLE {pack.Name}");
+                        continue;
+                    }
+
+                    if (IsVoicePackRemoteChanged(pack, remote))
+                    {
+                        changed.Add(pack.DisplayName);
+                        WriteLog($"VOICE_PACK_UPDATE_AVAILABLE {pack.Name} etag={remote.Etag} length={remote.ContentLength} modified={remote.LastModified}");
+                    }
+                    else
+                    {
+                        WriteLog($"VOICE_PACK_UPDATE_CURRENT {pack.Name}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    WriteLog($"VOICE_PACK_UPDATE_PACK_FAIL {pack.Name}: {ex.GetType().Name}: {ex.Message}");
+                }
+            }
+
+            lock (_voicePackUpdateLock)
+            {
+                _voicePackUpdateToastMessage = changed.Count == 0 ? "" : BuildVoicePackUpdateToast(changed);
+                _nextVoicePackUpdateToastUtc = DateTime.MinValue;
+                _voicePackUpdateCheckRunning = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            lock (_voicePackUpdateLock) _voicePackUpdateCheckRunning = false;
+            WriteLog($"VOICE_PACK_UPDATE_CHECK_FAIL {source}: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static List<InstalledVoicePackState> LoadInstalledVoicePackStates()
+    {
+        var statePath = Path.Combine(Paths.BepInExRootPath, "config", "spore.zeroparades.voicepacks.json");
+        var result = new List<InstalledVoicePackState>();
+        if (!File.Exists(statePath)) return result;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(statePath));
+            if (!doc.RootElement.TryGetProperty("packs", out var packsElement)
+                || packsElement.ValueKind != JsonValueKind.Object)
+            {
+                return result;
+            }
+
+            foreach (var packProperty in packsElement.EnumerateObject())
+            {
+                var pack = packProperty.Value;
+                if (pack.ValueKind != JsonValueKind.Object) continue;
+
+                var name = packProperty.Name;
+                var displayName = GetJsonString(pack, "displayName");
+                if (string.IsNullOrWhiteSpace(displayName)) displayName = name;
+
+                var updateUrl = GetJsonString(pack, "updateUrl");
+                if (string.IsNullOrWhiteSpace(updateUrl)) updateUrl = GetJsonString(pack, "url");
+
+                result.Add(new InstalledVoicePackState
+                {
+                    Name = name,
+                    DisplayName = displayName,
+                    UpdateUrl = updateUrl,
+                    Etag = GetJsonString(pack, "etag"),
+                    LastModified = GetJsonString(pack, "lastModified"),
+                    ContentLength = GetJsonInt64(pack, "contentLength"),
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"VOICE_PACK_UPDATE_STATE_READ_FAIL {statePath}: {ex.GetType().Name}: {ex.Message}");
+        }
+
+        return result;
+    }
+
+    private static string GetJsonString(JsonElement element, string name)
+    {
+        try
+        {
+            if (element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String)
+            {
+                return property.GetString() ?? "";
+            }
+        }
+        catch { }
+        return "";
+    }
+
+    private static long GetJsonInt64(JsonElement element, string name)
+    {
+        try
+        {
+            if (element.TryGetProperty(name, out var property))
+            {
+                if (property.ValueKind == JsonValueKind.Number && property.TryGetInt64(out var value)) return value;
+                if (property.ValueKind == JsonValueKind.String && long.TryParse(property.GetString(), out value)) return value;
+            }
+        }
+        catch { }
+        return -1;
+    }
+
+    private static RemoteVoicePackMetadata? GetRemoteVoicePackMetadata(string url)
+    {
+        System.Net.HttpWebResponse? response = null;
+        try
+        {
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            request.Method = "HEAD";
+            request.UserAgent = "ZeroParadesVoiceOverride/0.3.13";
+            request.AllowAutoRedirect = true;
+            request.Timeout = 15000;
+            request.ReadWriteTimeout = 30000;
+
+            response = (System.Net.HttpWebResponse)request.GetResponse();
+            var lastModified = "";
+            try
+            {
+                if (response.LastModified > DateTime.MinValue)
+                {
+                    lastModified = response.LastModified.ToUniversalTime().ToString("o");
+                }
+            }
+            catch { }
+
+            return new RemoteVoicePackMetadata
+            {
+                Etag = response.Headers["ETag"] ?? "",
+                LastModified = lastModified,
+                ContentLength = response.ContentLength,
+            };
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"VOICE_PACK_UPDATE_HEAD_FAIL {url}: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            try { response?.Dispose(); } catch { }
+        }
+    }
+
+    private static bool IsVoicePackRemoteChanged(InstalledVoicePackState installed, RemoteVoicePackMetadata remote)
+    {
+        if (!string.IsNullOrWhiteSpace(installed.Etag) && !string.IsNullOrWhiteSpace(remote.Etag))
+        {
+            return !string.Equals(installed.Etag, remote.Etag, StringComparison.Ordinal);
+        }
+
+        if (installed.ContentLength > 0 && remote.ContentLength > 0)
+        {
+            return installed.ContentLength != remote.ContentLength;
+        }
+
+        if (!string.IsNullOrWhiteSpace(installed.LastModified) && !string.IsNullOrWhiteSpace(remote.LastModified))
+        {
+            return !string.Equals(installed.LastModified, remote.LastModified, StringComparison.Ordinal);
+        }
+
+        return false;
+    }
+
+    private static string BuildVoicePackUpdateToast(List<string> changedPacks)
+    {
+        if (changedPacks.Count == 1)
+        {
+            return $"Voice line update available: {changedPacks[0]}. Run Install.bat.";
+        }
+
+        if (changedPacks.Count <= 3)
+        {
+            return $"Voice line updates available: {string.Join(", ", changedPacks)}. Run Install.bat.";
+        }
+
+        return $"Voice line updates available for {changedPacks.Count} packs. Run Install.bat.";
+    }
+
+    internal static void PollVoicePackUpdateNotifications()
+    {
+        if (!VoicePackUpdateToastsEnabled) return;
+
+        var now = DateTime.UtcNow;
+        StartVoicePackUpdateCheck("POLL", force: false);
+
+        string message;
+        lock (_voicePackUpdateLock)
+        {
+            if (string.IsNullOrWhiteSpace(_voicePackUpdateToastMessage)
+                || now < _nextVoicePackUpdateToastUtc)
+            {
+                return;
+            }
+
+            message = _voicePackUpdateToastMessage;
+            _nextVoicePackUpdateToastUtc = now.AddMinutes(GetVoicePackUpdateToastRepeatMinutes());
+        }
+
+        ShowToast(message);
+    }
+
+    private static void SetVoicePackUpdateToastsEnabled(bool enabled, string source)
+    {
+        VoicePackUpdateToastsEnabled = enabled;
+        if (_voicePackUpdateToastsEnabledEntry != null) _voicePackUpdateToastsEnabledEntry.Value = enabled;
+        if (!enabled)
+        {
+            lock (_voicePackUpdateLock)
+            {
+                _voicePackUpdateToastMessage = "";
+                _nextVoicePackUpdateToastUtc = DateTime.MaxValue;
+            }
+        }
+        else
+        {
+            lock (_voicePackUpdateLock)
+            {
+                _nextVoicePackUpdateToastUtc = DateTime.MinValue;
+                _lastVoicePackUpdateCheckUtc = DateTime.MinValue;
+            }
+            StartVoicePackUpdateCheck(source, force: true);
+        }
+
+        SaveConfig();
+        WriteLog($"OPTION_VOICE_PACK_UPDATE_TOASTS {enabled} source={source}");
+        ShowToast(enabled ? "Voice update toasts: ON" : "Voice update toasts: OFF");
     }
 
     private static Type? FindType(string fullName)
@@ -271,6 +669,28 @@ public class VoiceOverridePlugin : BasePlugin
         return null;
     }
 
+    internal static object? TryGetMemberObject(object? obj, string name)
+    {
+        if (obj == null) return null;
+        var t = obj.GetType();
+        foreach (var flags in new[] { BindingFlags.Public | BindingFlags.Instance, BindingFlags.NonPublic | BindingFlags.Instance })
+        {
+            try
+            {
+                var p = t.GetProperty(name, flags);
+                if (p != null) return p.GetValue(obj);
+            }
+            catch { }
+            try
+            {
+                var f = t.GetField(name, flags);
+                if (f != null) return f.GetValue(obj);
+            }
+            catch { }
+        }
+        return null;
+    }
+
     internal static string? CardIdFromRtCard(object? card)
     {
         if (card == null) return null;
@@ -282,11 +702,272 @@ public class VoiceOverridePlugin : BasePlugin
         return null;
     }
 
+    private static string? DialogueTextFromRtCard(object? card)
+    {
+        if (card == null) return null;
+
+        foreach (var n in DialogueTextMemberNames)
+        {
+            var text = CleanDialogueText(TryGetMemberString(card, n));
+            if (!string.IsNullOrWhiteSpace(text)) return text;
+        }
+
+        foreach (var n in new[] { "CardData", "cardData", "m_cardData", "Data", "data", "Properties", "properties" })
+        {
+            var data = TryGetMemberObject(card, n);
+            var text = DialogueTextFromProperties(data);
+            if (!string.IsNullOrWhiteSpace(text)) return text;
+        }
+
+        return null;
+    }
+
+    private static readonly string[] DialogueTextMemberNames =
+    {
+        "Text", "text", "DialogueText", "dialogueText", "Line", "line", "Content", "content",
+        "Body", "body", "Description", "description", "Title", "title", "Subtitle", "subtitle",
+        "DisplayText", "displayText", "LocalizedText", "localizedText", "m_text", "m_dialogueText",
+    };
+
+    private static readonly string[] DialogueTextKeys =
+    {
+        "text", "Text", "dialogueText", "DialogueText", "dialogue_text", "line", "Line",
+        "content", "Content", "body", "Body", "description", "Description", "title", "Title",
+        "displayText", "DisplayText", "localizedText", "LocalizedText",
+    };
+
+    private static string? DialogueTextFromProperties(object? data)
+    {
+        if (data == null) return null;
+
+        foreach (var n in DialogueTextMemberNames)
+        {
+            var text = CleanDialogueText(TryGetMemberString(data, n));
+            if (!string.IsNullOrWhiteSpace(text)) return text;
+        }
+
+        foreach (var key in DialogueTextKeys)
+        {
+            var value = TryGetIndexedOrNamedValue(data, key);
+            var text = CleanDialogueTextFromValue(value);
+            if (!string.IsNullOrWhiteSpace(text)) return text;
+        }
+
+        return null;
+    }
+
+    private static object? TryGetIndexedOrNamedValue(object data, string key)
+    {
+        var t = data.GetType();
+        foreach (var flags in new[] { BindingFlags.Public | BindingFlags.Instance, BindingFlags.NonPublic | BindingFlags.Instance })
+        {
+            try
+            {
+                foreach (var p in t.GetProperties(flags))
+                {
+                    var indexParameters = p.GetIndexParameters();
+                    if (indexParameters.Length == 1)
+                    {
+                        return p.GetValue(data, new object[] { key });
+                    }
+                }
+            }
+            catch { }
+
+            foreach (var methodName in new[] { "get_Item", "Get", "GetValue", "GetString" })
+            {
+                try
+                {
+                    var methods = t.GetMethods(flags).Where(m => m.Name == methodName);
+                    foreach (var m in methods)
+                    {
+                        var parameters = m.GetParameters();
+                        if (parameters.Length == 1)
+                        {
+                            return m.Invoke(data, new object[] { key });
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            try
+            {
+                var tryGetMethods = t.GetMethods(flags).Where(m => m.Name == "TryGetValue");
+                foreach (var m in tryGetMethods)
+                {
+                    var parameters = m.GetParameters();
+                    if (parameters.Length == 2 && parameters[1].ParameterType.IsByRef)
+                    {
+                        var args = new object?[] { key, null };
+                        var ok = m.Invoke(data, args);
+                        if (ok is bool b && b) return args[1];
+                    }
+                }
+            }
+            catch { }
+        }
+
+        return null;
+    }
+
+    private static string? CleanDialogueTextFromValue(object? value)
+    {
+        if (value == null) return null;
+
+        foreach (var n in new[] { "Value", "value", "StringValue", "stringValue", "Text", "text", "RawValue", "rawValue" })
+        {
+            var text = CleanDialogueText(TryGetMemberString(value, n));
+            if (!string.IsNullOrWhiteSpace(text)) return text;
+        }
+
+        return CleanDialogueText(S(value));
+    }
+
+    private static string? CleanDialogueText(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var text = raw.Trim();
+        if (text.Length == 0
+            || text.Equals("<null>", StringComparison.OrdinalIgnoreCase)
+            || text.Equals("<nullstr>", StringComparison.OrdinalIgnoreCase)
+            || text.StartsWith("ZAUM.", StringComparison.Ordinal)
+            || text.Contains("RtPropertiesDictionary", StringComparison.Ordinal)
+            || text.Contains("Il2Cpp", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return string.Join(" ", text.Split(new[] { '\r', '\n', '\t' }, StringSplitOptions.RemoveEmptyEntries).Select(part => part.Trim()));
+    }
+
+    private static void TrackLatestDialogueCard(string source, object? card)
+    {
+        var id = CardIdFromRtCard(card);
+        if (string.IsNullOrWhiteSpace(id)) return;
+        TrackLatestDialogue(source, id, DialogueTextFromRtCard(card));
+    }
+
+    private static void TrackLatestDialogueId(string source, string? id)
+    {
+        if (string.IsNullOrWhiteSpace(id)) return;
+        TrackLatestDialogue(source, id, null);
+    }
+
+    private static void TrackLatestDialogue(string source, string id, string? text)
+    {
+        var cleanedText = CleanDialogueText(text);
+        if (!string.IsNullOrWhiteSpace(cleanedText))
+        {
+            _dialogueTextById[id] = cleanedText;
+        }
+        else if (_dialogueTextById.TryGetValue(id, out var cached))
+        {
+            cleanedText = cached;
+        }
+
+        _latestDialogueId = id;
+        _latestDialogueText = cleanedText ?? "";
+        _latestDialogueSource = source;
+        _latestDialogueUtc = DateTime.UtcNow;
+    }
+
+    private static void ReportLatestDialogue(string source)
+    {
+        if (string.IsNullOrWhiteSpace(_latestDialogueId))
+        {
+            WriteLog($"LATEST_DIALOGUE_REPORT_EMPTY source={source}");
+            ShowToast("No dialogue captured yet.", 4f);
+            return;
+        }
+
+        var ageSeconds = Math.Max(0, (int)(DateTime.UtcNow - _latestDialogueUtc).TotalSeconds);
+        var text = string.IsNullOrWhiteSpace(_latestDialogueText) ? "(text not captured)" : _latestDialogueText;
+        WriteLog($"LATEST_DIALOGUE_REPORT source={source} id={_latestDialogueId} ageSeconds={ageSeconds} from={_latestDialogueSource} text={SanitizeForLog(text)}");
+        var reportPath = Path.Combine(GetGameRootPath(), LatestDialogueReportFileName);
+        var report = BuildLatestDialogueReport(source, ageSeconds, text, reportPath);
+        try
+        {
+            File.WriteAllText(reportPath, report, System.Text.Encoding.UTF8);
+            WriteLog($"LATEST_DIALOGUE_REPORT_FILE {reportPath}");
+            ShowToast(report, 16f);
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"LATEST_DIALOGUE_REPORT_FILE_FAIL {reportPath}: {ex.GetType().Name}: {ex.Message}");
+            ShowToast($"{report}\n\nReport file write failed: {ex.GetType().Name}: {ex.Message}", 16f);
+        }
+    }
+
+    private static string BuildLatestDialogueReport(string source, int ageSeconds, string text, string reportPath)
+    {
+        var capturedLocal = _latestDialogueUtc == DateTime.MinValue ? "(unknown)" : _latestDialogueUtc.ToLocalTime().ToString("O");
+        var capturedUtc = _latestDialogueUtc == DateTime.MinValue ? "(unknown)" : _latestDialogueUtc.ToString("O");
+        var maleRoot = ResolveBepInExPath(_maleOverrideRootEntry?.Value, "voice-overrides");
+        var femaleRoot = ResolveBepInExPath(_femaleOverrideRootEntry?.Value, "voice-overrides-female");
+
+        return string.Join(Environment.NewLine, new[]
+        {
+            "ZERO PARADES Voice Override latest dialogue report",
+            "Share this file with the mod author when reporting a dialogue issue.",
+            $"Report file: {reportPath}",
+            $"Reported local time: {DateTime.Now:O}",
+            $"Reported UTC: {DateTime.UtcNow:O}",
+            $"Report source: {source}",
+            $"Dialogue ID: {_latestDialogueId}",
+            "Dialogue text:",
+            text,
+            $"Captured by: {_latestDialogueSource}",
+            $"Captured local time: {capturedLocal}",
+            $"Captured UTC: {capturedUtc}",
+            $"Age seconds: {ageSeconds}",
+            $"Preset: {CurrentPresetName()}",
+            $"Voice state: {FormatVoiceState()}",
+            $"Override enabled: {OverrideEnabled}",
+            $"Original voice when override exists: {OriginalVoiceEnabledForOverrides}",
+            $"Allow original if override fails: {AllowOriginalOnOverrideFailure}",
+            $"Debug toasts enabled: {DebugToastsEnabled}",
+            $"Update toasts enabled: {VoicePackUpdateToastsEnabled}",
+            $"Active redub root: {(string.IsNullOrWhiteSpace(OverrideRoot) ? "(none)" : OverrideRoot)}",
+            $"Male redub root: {maleRoot}",
+            $"Female redub root: {femaleRoot}",
+            $"Extras root: {ExtraOverrideRoot}",
+            $"Narrator missing VO root: {NarratorOverrideRoot}",
+            $"Plugin log: {LogPath}"
+        });
+    }
+
+    private static string GetGameRootPath()
+    {
+        try
+        {
+            var bepinexRoot = Paths.BepInExRootPath;
+            if (!string.IsNullOrWhiteSpace(bepinexRoot))
+            {
+                return Path.GetFullPath(Path.Combine(bepinexRoot, ".."));
+            }
+        }
+        catch { }
+
+        try { return Directory.GetCurrentDirectory(); }
+        catch { return "."; }
+    }
+
+    private static string SanitizeForLog(string value)
+    {
+        return value.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
+    }
+
     internal static string? FindOverrideFile(string id)
+    {
+        return FindOverrideFile(id, EnumerateOverrideRoots());
+    }
+
+    private static string? FindOverrideFile(string id, IEnumerable<string> roots)
     {
         if (string.IsNullOrWhiteSpace(id)) return null;
         var safe = id.Replace('/', '_').Replace('\\', '_').Replace(':', '_');
-        foreach (var root in EnumerateOverrideRoots())
+        foreach (var root in roots.Where(r => !string.IsNullOrWhiteSpace(r)).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             foreach (var ext in new[] { ".wav", ".ogg" })
             {
@@ -308,12 +989,72 @@ public class VoiceOverridePlugin : BasePlugin
 
     private static IEnumerable<string> EnumerateOverrideRoots()
     {
+        if (IsRedubEnabled() && !string.IsNullOrWhiteSpace(OverrideRoot)) yield return OverrideRoot;
+    }
+
+    private static string? FindReplacementVoiceFile(string id)
+    {
+        if (!IsRedubEnabled()) return null;
+        return FindOverrideFile(id, EnumerateOverrideRoots());
+    }
+
+    private static string? FindMissingVoiceFile(string id, out string source)
+    {
+        source = "";
+        if (!OverrideEnabled) return null;
+
+        if (NarratorMissingVoicesEnabled && !string.IsNullOrWhiteSpace(NarratorOverrideRoot))
+        {
+            var narrator = FindOverrideFile(id, new[] { NarratorOverrideRoot });
+            if (narrator != null)
+            {
+                source = "narrator";
+                return narrator;
+            }
+        }
+
+        if (ExtraVoicesEnabled && !string.IsNullOrWhiteSpace(ExtraOverrideRoot))
+        {
+            var extra = FindOverrideFile(id, new[] { ExtraOverrideRoot });
+            if (extra != null)
+            {
+                source = "extras";
+                return extra;
+            }
+        }
+
+        if (IsRedubEnabled() && IsSilentCardFallbackAllowed(id))
+        {
+            var redub = FindOverrideFile(id, EnumerateOverrideRoots());
+            if (redub != null)
+            {
+                source = _overrideProfile;
+                return redub;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> EnumerateSilentCardIndexRoots()
+    {
         if (!string.IsNullOrWhiteSpace(OverrideRoot)) yield return OverrideRoot;
         if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)
             && !string.Equals(ExtraOverrideRoot, OverrideRoot, StringComparison.OrdinalIgnoreCase))
         {
             yield return ExtraOverrideRoot;
         }
+        if (!string.IsNullOrWhiteSpace(NarratorOverrideRoot)
+            && !string.Equals(NarratorOverrideRoot, OverrideRoot, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(NarratorOverrideRoot, ExtraOverrideRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            yield return NarratorOverrideRoot;
+        }
+    }
+
+    private static bool IsRedubEnabled()
+    {
+        return OverrideEnabled && !string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void LoadSilentCardIndex()
@@ -321,14 +1062,18 @@ public class VoiceOverridePlugin : BasePlugin
         _silentCardIds.Clear();
         _silentCardIndexLoaded = false;
 
-        var candidates = new[]
-        {
-            Path.Combine(OverrideRoot, "_silent-card-ids.txt"),
-            Path.Combine(ExtraOverrideRoot, "_silent-card-ids.txt"),
-            Path.Combine(Paths.BepInExRootPath, "voice-overrides", "_silent-card-ids.txt"),
-            Path.Combine(Paths.BepInExRootPath, "voice-override-extras", "_silent-card-ids.txt"),
-            Path.Combine(Paths.BepInExRootPath, "voice-overrides-silent-card-ids.txt"),
-        }.Distinct().ToArray();
+        var candidates = EnumerateSilentCardIndexRoots()
+            .Select(root => Path.Combine(root, "_silent-card-ids.txt"))
+            .Concat(new[]
+            {
+                Path.Combine(Paths.BepInExRootPath, "voice-overrides", "_silent-card-ids.txt"),
+                Path.Combine(Paths.BepInExRootPath, "voice-override-extras", "_silent-card-ids.txt"),
+                Path.Combine(Paths.BepInExRootPath, "voice-override-narrator", "_silent-card-ids.txt"),
+                Path.Combine(Paths.BepInExRootPath, "voice-overrides-silent-card-ids.txt"),
+            })
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         foreach (var path in candidates)
         {
@@ -369,16 +1114,24 @@ public class VoiceOverridePlugin : BasePlugin
             WriteLog($"{source} NO_ID");
             return true;
         }
-        var file = FindOverrideFile(id);
-        if (file == null)
-        {
-            WriteLog($"{source} NO_OVERRIDE {id}");
-            return true;
-        }
+        TrackLatestDialogueId(source, id);
 
         if (!OverrideEnabled)
         {
             WriteLog($"{source} OVERRIDE_DISABLED_ALLOW_ORIGINAL {id}");
+            return true;
+        }
+
+        if (!IsRedubEnabled())
+        {
+            WriteLog($"{source} REDUB_DISABLED_ALLOW_ORIGINAL {id}");
+            return true;
+        }
+
+        var file = FindReplacementVoiceFile(id);
+        if (file == null)
+        {
+            WriteLog($"{source} NO_REDUB_OVERRIDE {id}");
             return true;
         }
 
@@ -435,10 +1188,12 @@ public class VoiceOverridePlugin : BasePlugin
                 return;
             }
 
-            if (!IsSilentCardFallbackAllowed(id))
+            var file = FindMissingVoiceFile(id, out var missingSource);
+            if (file == null)
             {
                 return;
             }
+            TrackLatestDialogueCard(source, card);
 
             if (!string.Equals(_lastShownCardId, id, StringComparison.Ordinal))
             {
@@ -458,22 +1213,19 @@ public class VoiceOverridePlugin : BasePlugin
                 return;
             }
 
-            var file = FindOverrideFile(id);
-            if (file == null) return;
-
             _recentCardShownQueuesUtc[id] = now;
             _cardShownAppearanceQueuedOrPlayed = true;
             if (_runner != null && _runner.QueueDelayedUnityAudio(file, id, CardShownFallbackDelayMs))
             {
-                WriteLog($"{source} DELAYED_OVERRIDE {id} {file}");
-                ShowDebugToast($"Missing VO: {id}");
+                WriteLog($"{source} DELAYED_OVERRIDE {id} source={missingSource} {file}");
+                ShowDebugToast($"Missing VO ({missingSource}): {id}");
             }
             else if (string.Equals(Path.GetExtension(file), ".wav", StringComparison.OrdinalIgnoreCase))
             {
-                WriteLog($"{source} DELAYED_FALLBACK_NATIVE {id} {file}");
+                WriteLog($"{source} DELAYED_FALLBACK_NATIVE {id} source={missingSource} {file}");
                 PlayWavNative(file, id);
                 MarkImmediateOverride(id);
-                ShowDebugToast($"Missing VO: {id}");
+                ShowDebugToast($"Missing VO ({missingSource}): {id}");
             }
         }
         catch (Exception ex)
@@ -513,12 +1265,32 @@ public class VoiceOverridePlugin : BasePlugin
     {
         if (WasKeyPressed(_toggleOverrideKeyEntry))
         {
-            SetOverrideEnabled(!OverrideEnabled, "HOTKEY");
+            ApplyNextPreset("HOTKEY");
         }
 
         if (WasKeyPressed(_cycleProfileKeyEntry))
         {
             SetOverrideProfile(NextOverrideProfile(), "HOTKEY");
+        }
+
+        if (WasKeyPressed(_toggleExtraVoicesKeyEntry))
+        {
+            SetExtraVoicesEnabled(!ExtraVoicesEnabled, "HOTKEY");
+        }
+
+        if (WasKeyPressed(_toggleNarratorMissingVoicesKeyEntry))
+        {
+            SetNarratorMissingVoicesEnabled(!NarratorMissingVoicesEnabled, "HOTKEY");
+        }
+
+        if (WasKeyPressed(_toggleVoicePackUpdateToastsKeyEntry))
+        {
+            SetVoicePackUpdateToastsEnabled(!VoicePackUpdateToastsEnabled, "HOTKEY");
+        }
+
+        if (WasKeyPressed(_reportLatestDialogueKeyEntry))
+        {
+            ReportLatestDialogue("HOTKEY");
         }
 
         if (WasKeyPressed(KeyCode.F12))
@@ -532,6 +1304,7 @@ public class VoiceOverridePlugin : BasePlugin
         return _overrideProfile switch
         {
             "male" => "female",
+            "female" => "off",
             _ => "male",
         };
     }
@@ -560,17 +1333,143 @@ public class VoiceOverridePlugin : BasePlugin
         ShowToast(enabled ? "Voice overrides: ON" : "Voice overrides: OFF - original VO");
     }
 
+    private static void ApplyNextPreset(string source)
+    {
+        var current = CurrentPresetName();
+        var next = current switch
+        {
+            "original" => "missing",
+            "missing" => "male",
+            "male" => "female",
+            "female" => "original",
+            _ => "original",
+        };
+        ApplyPreset(next, source);
+    }
+
+    private static string CurrentPresetName()
+    {
+        if (!OverrideEnabled || (string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase)
+            && !ExtraVoicesEnabled
+            && !NarratorMissingVoicesEnabled))
+        {
+            return "original";
+        }
+
+        if (string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase)
+            && ExtraVoicesEnabled
+            && NarratorMissingVoicesEnabled)
+        {
+            return "missing";
+        }
+
+        if (string.Equals(_overrideProfile, "male", StringComparison.OrdinalIgnoreCase)
+            && ExtraVoicesEnabled
+            && !NarratorMissingVoicesEnabled)
+        {
+            return "male";
+        }
+
+        if (string.Equals(_overrideProfile, "female", StringComparison.OrdinalIgnoreCase)
+            && ExtraVoicesEnabled
+            && !NarratorMissingVoicesEnabled)
+        {
+            return "female";
+        }
+
+        return "custom";
+    }
+
+    private static void ApplyPreset(string preset, string source)
+    {
+        switch (preset)
+        {
+            case "missing":
+                ApplyVoiceState("off", extraVoices: true, narratorMissingVoices: true, masterEnabled: true, source, "Preset: Original + missing VO");
+                break;
+            case "male":
+                ApplyVoiceState("male", extraVoices: true, narratorMissingVoices: false, masterEnabled: true, source, "Preset: Male redub");
+                break;
+            case "female":
+                ApplyVoiceState("female", extraVoices: true, narratorMissingVoices: false, masterEnabled: true, source, "Preset: Female redub");
+                break;
+            default:
+                ApplyVoiceState("off", extraVoices: false, narratorMissingVoices: false, masterEnabled: false, source, "Preset: Original game VO");
+                break;
+        }
+    }
+
+    private static void ApplyVoiceState(string profile, bool extraVoices, bool narratorMissingVoices, bool masterEnabled, string source, string toast)
+    {
+        var normalized = NormalizeProfile(profile);
+        _overrideProfile = normalized;
+        ExtraVoicesEnabled = extraVoices;
+        NarratorMissingVoicesEnabled = narratorMissingVoices;
+        OverrideEnabled = masterEnabled && (!string.Equals(normalized, "off", StringComparison.OrdinalIgnoreCase) || extraVoices || narratorMissingVoices);
+
+        if (_overrideProfileEntry != null) _overrideProfileEntry.Value = normalized;
+        if (_extraVoicesEnabledEntry != null) _extraVoicesEnabledEntry.Value = ExtraVoicesEnabled;
+        if (_narratorMissingVoicesEnabledEntry != null) _narratorMissingVoicesEnabledEntry.Value = NarratorMissingVoicesEnabled;
+        if (_overrideEnabledEntry != null) _overrideEnabledEntry.Value = OverrideEnabled;
+
+        ResolveOverrideRoot();
+        LoadSilentCardIndex();
+        _runner?.StopPlaybackFromGame($"{source}_VOICE_STATE_CHANGE");
+        SaveConfig();
+        WriteLog($"OPTION_VOICE_STATE preset={CurrentPresetName()} overrideEnabled={OverrideEnabled} profile={_overrideProfile} extras={ExtraVoicesEnabled} narratorMissing={NarratorMissingVoicesEnabled} source={source}");
+        ShowToast($"{toast} ({FormatVoiceState()})");
+    }
+
+    private static string FormatVoiceState()
+    {
+        var redub = string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase)
+            ? "redub off"
+            : $"redub {_overrideProfile}";
+        var extras = ExtraVoicesEnabled ? "extras on" : "extras off";
+        var narrator = NarratorMissingVoicesEnabled ? "narrator missing on" : "narrator missing off";
+        return $"{redub}, {extras}, {narrator}";
+    }
+
     private static void SetOverrideProfile(string profile, string source)
     {
         var normalized = NormalizeProfile(profile);
+        var masterEnabled = !string.Equals(normalized, "off", StringComparison.OrdinalIgnoreCase)
+            || ExtraVoicesEnabled
+            || NarratorMissingVoicesEnabled;
         if (_overrideProfileEntry != null) _overrideProfileEntry.Value = normalized;
         _overrideProfile = normalized;
+        OverrideEnabled = masterEnabled;
+        if (_overrideEnabledEntry != null) _overrideEnabledEntry.Value = OverrideEnabled;
         ResolveOverrideRoot();
         LoadSilentCardIndex();
         _runner?.StopPlaybackFromGame($"{source}_PROFILE_SWITCH");
         SaveConfig();
-        WriteLog($"OPTION_OVERRIDE_PROFILE {normalized} root={OverrideRoot} source={source}");
-        ShowToast($"Voice profile: {normalized.ToUpperInvariant()}");
+        WriteLog($"OPTION_OVERRIDE_PROFILE {normalized} root={OverrideRoot} overrideEnabled={OverrideEnabled} source={source}");
+        ShowToast($"Redub profile: {normalized.ToUpperInvariant()} ({FormatVoiceState()})");
+    }
+
+    private static void SetExtraVoicesEnabled(bool enabled, string source)
+    {
+        ExtraVoicesEnabled = enabled;
+        OverrideEnabled = enabled || NarratorMissingVoicesEnabled || !string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase);
+        if (_extraVoicesEnabledEntry != null) _extraVoicesEnabledEntry.Value = enabled;
+        if (_overrideEnabledEntry != null) _overrideEnabledEntry.Value = OverrideEnabled;
+        if (!OverrideEnabled) _runner?.StopPlaybackFromGame($"{source}_EXTRAS_DISABLED");
+        SaveConfig();
+        WriteLog($"OPTION_EXTRA_VOICES {enabled} overrideEnabled={OverrideEnabled} source={source}");
+        ShowToast(enabled ? $"Extras: ON ({FormatVoiceState()})" : $"Extras: OFF ({FormatVoiceState()})");
+    }
+
+    private static void SetNarratorMissingVoicesEnabled(bool enabled, string source)
+    {
+        NarratorMissingVoicesEnabled = enabled;
+        OverrideEnabled = enabled || ExtraVoicesEnabled || !string.Equals(_overrideProfile, "off", StringComparison.OrdinalIgnoreCase);
+        if (_narratorMissingVoicesEnabledEntry != null) _narratorMissingVoicesEnabledEntry.Value = enabled;
+        if (_overrideEnabledEntry != null) _overrideEnabledEntry.Value = OverrideEnabled;
+        if (!OverrideEnabled) _runner?.StopPlaybackFromGame($"{source}_NARRATOR_DISABLED");
+        SaveConfig();
+        WriteLog($"OPTION_NARRATOR_MISSING_VOICES {enabled} overrideEnabled={OverrideEnabled} source={source}");
+        ShowToast(enabled ? $"Narrator missing VO: ON ({FormatVoiceState()})" : $"Narrator missing VO: OFF ({FormatVoiceState()})");
     }
 
     private static void SetDebugToastsEnabled(bool enabled, string source)
@@ -580,10 +1479,10 @@ public class VoiceOverridePlugin : BasePlugin
         ShowToast(enabled ? "Voice debug toasts: ON" : "Voice debug toasts: OFF");
     }
 
-    internal static void ShowToast(string message)
+    internal static void ShowToast(string message, float seconds = 2.75f)
     {
         _toastMessage = message;
-        try { _toastUntilRealtime = Time.realtimeSinceStartup + 2.25f; }
+        try { _toastUntilRealtime = Time.realtimeSinceStartup + Math.Max(1f, seconds); }
         catch { _toastUntilRealtime = 0f; }
         WriteLog($"TOAST {message}");
     }
@@ -605,10 +1504,34 @@ public class VoiceOverridePlugin : BasePlugin
                 return;
             }
 
-            var width = Math.Min(520f, Math.Max(260f, Screen.width - 48f));
-            const float height = 42f;
-            var rect = new Rect((Screen.width - width) * 0.5f, 28f, width, height);
-            GUI.Box(rect, _toastMessage);
+            var isReportToast = _toastMessage.IndexOf("ZERO PARADES Voice Override latest dialogue report", StringComparison.OrdinalIgnoreCase) >= 0;
+            var width = isReportToast
+                ? Math.Min(1200f, Math.Max(520f, Screen.width - 64f))
+                : Math.Min(860f, Math.Max(360f, Screen.width - 96f));
+            var style = new GUIStyle(GUI.skin.box)
+            {
+                fontSize = isReportToast ? 16 : 22,
+                fontStyle = isReportToast ? FontStyle.Normal : FontStyle.Bold,
+                alignment = isReportToast ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
+                wordWrap = true,
+            };
+            style.padding = isReportToast ? new RectOffset(26, 26, 18, 18) : new RectOffset(24, 24, 14, 14);
+            style.normal.textColor = Color.white;
+
+            var content = new GUIContent(_toastMessage);
+            var maxHeight = isReportToast ? Math.Max(160f, Screen.height - 56f) : 220f;
+            if (isReportToast)
+            {
+                for (var size = style.fontSize; size > 11 && style.CalcHeight(content, width) + 24f > maxHeight; size--)
+                {
+                    style.fontSize = size - 1;
+                }
+            }
+
+            var height = Math.Min(maxHeight, Math.Max(72f, style.CalcHeight(content, width) + (isReportToast ? 26f : 18f)));
+            var bottomOffset = isReportToast ? 28f : 72f;
+            var rect = new Rect((Screen.width - width) * 0.5f, Math.Max(20f, Screen.height - height - bottomOffset), width, height);
+            GUI.Box(rect, content, style);
         }
         catch
         {
@@ -1003,6 +1926,7 @@ public class VoiceOverridePlugin : BasePlugin
     {
         public static bool Prefix(object __instance, string cardVOID)
         {
+            VoiceOverridePlugin.TrackLatestDialogueId("PlayVO", cardVOID);
             return VoiceOverridePlugin.TryReplace("PlayVO", cardVOID, __instance);
         }
     }
@@ -1019,6 +1943,7 @@ public class VoiceOverridePlugin : BasePlugin
     {
         public static bool Prefix(object currentCard)
         {
+            VoiceOverridePlugin.TrackLatestDialogueCard("FireVOEvent", currentCard);
             var id = VoiceOverridePlugin.CardIdFromRtCard(currentCard);
             return VoiceOverridePlugin.TryReplace("FireVOEvent", id);
         }
@@ -1032,13 +1957,30 @@ public class VoiceOverridePlugin : BasePlugin
         }
     }
 
-    private static class Patch_BeforeUpdateConversation
-    {
-        public static void Prefix(object __instance, object __0)
-        {
-            VoiceOverridePlugin.TryPlayCardShownFallback("BeforeUpdateConversation", __0, __instance);
-        }
-    }
+  private static class Patch_BeforeUpdateConversation
+  {
+      public static void Prefix(object __instance, object __0)
+      {
+          VoiceOverridePlugin.TryPlayCardShownFallback("BeforeUpdateConversation", __0, __instance);
+      }
+  }
+
+  private sealed class InstalledVoicePackState
+  {
+      public string Name = "";
+      public string DisplayName = "";
+      public string UpdateUrl = "";
+      public string Etag = "";
+      public string LastModified = "";
+      public long ContentLength = -1;
+  }
+
+  private sealed class RemoteVoicePackMetadata
+  {
+      public string Etag = "";
+      public string LastModified = "";
+      public long ContentLength = -1;
+  }
 }
 
 public sealed class VoiceOverrideRunner : MonoBehaviour
@@ -1153,10 +2095,11 @@ public sealed class VoiceOverrideRunner : MonoBehaviour
 
     public void Update()
     {
-        try
-        {
-            VoiceOverridePlugin.PollRuntimeHotkeys();
-            CleanupFinishedPlayback();
+      try
+      {
+          VoiceOverridePlugin.PollRuntimeHotkeys();
+          VoiceOverridePlugin.PollVoicePackUpdateNotifications();
+          CleanupFinishedPlayback();
             PollClipLoad();
             PollDelayedAudio();
             if (_active == null && _clipLoad == null) StartNext();
