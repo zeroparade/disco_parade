@@ -14,7 +14,7 @@ using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.Networking;
 
-[BepInPlugin("spore.zeroparades.voiceoverride", "ZERO PARADES Voice Override", "0.3.15")]
+[BepInPlugin("spore.zeroparades.voiceoverride", "ZERO PARADES Voice Override", "0.3.21")]
 public class VoiceOverridePlugin : BasePlugin
 {
     internal static VoiceOverridePlugin? Instance;
@@ -23,6 +23,7 @@ public class VoiceOverridePlugin : BasePlugin
     internal static string ExtraOverrideRoot = "";
     internal static string NarratorOverrideRoot = "";
     internal static float Volume = 1.0f;
+    internal static bool UseFmodStreaming = true;
     internal static bool OverrideEnabled = true;
     internal static bool ExtraVoicesEnabled = true;
     internal static bool NarratorMissingVoicesEnabled = false;
@@ -30,6 +31,13 @@ public class VoiceOverridePlugin : BasePlugin
     internal static bool AllowOriginalOnOverrideFailure = true;
     internal static bool DebugToastsEnabled = false;
     internal static bool VoicePackUpdateToastsEnabled = true;
+    internal static bool LiveFixEnabled = true;
+    internal static bool LiveFixSkipOriginal = true;
+    internal static string LiveFixRoot = "";
+    internal static string LiveFixOverrideRoot = "";
+    internal static string LiveFixEventsPath = "";
+    internal static string LiveFixLatestPath = "";
+    internal static string LiveFixCommandPath = "";
     private static readonly HashSet<string> _silentCardIds = new(StringComparer.Ordinal);
     private static bool _silentCardIndexLoaded;
     private static ConfigEntry<bool>? _overrideEnabledEntry;
@@ -37,8 +45,12 @@ public class VoiceOverridePlugin : BasePlugin
     private static ConfigEntry<bool>? _narratorMissingVoicesEnabledEntry;
     private static ConfigEntry<bool>? _originalVoiceEnabledEntry;
     private static ConfigEntry<bool>? _allowOriginalOnOverrideFailureEntry;
+    private static ConfigEntry<bool>? _useFmodStreamingEntry;
     private static ConfigEntry<bool>? _voicePackUpdateToastsEnabledEntry;
     private static ConfigEntry<int>? _voicePackUpdateToastRepeatMinutesEntry;
+    private static ConfigEntry<bool>? _liveFixEnabledEntry;
+    private static ConfigEntry<bool>? _liveFixSkipOriginalEntry;
+    private static ConfigEntry<string>? _liveFixRootEntry;
     private static ConfigEntry<string>? _overrideProfileEntry;
     private static ConfigEntry<string>? _maleOverrideRootEntry;
     private static ConfigEntry<string>? _femaleOverrideRootEntry;
@@ -50,6 +62,10 @@ public class VoiceOverridePlugin : BasePlugin
     private static ConfigEntry<KeyCode>? _toggleNarratorMissingVoicesKeyEntry;
     private static ConfigEntry<KeyCode>? _reportLatestDialogueKeyEntry;
     private static ConfigEntry<KeyCode>? _toggleVoicePackUpdateToastsKeyEntry;
+    private static ConfigEntry<KeyCode>? _toggleDebugToastsKeyEntry;
+    private static ConfigEntry<KeyCode>? _liveFixMarkKeyEntry;
+    private static ConfigEntry<KeyCode>? _liveFixReplayKeyEntry;
+    private static ConfigEntry<KeyCode>? _liveFixToggleKeyEntry;
     private static string _overrideProfile = "male";
     private static string _toastMessage = "";
     private static float _toastUntilRealtime;
@@ -75,6 +91,16 @@ public class VoiceOverridePlugin : BasePlugin
     private static string _latestDialogueText = "";
     private static string _latestDialogueSource = "";
     private static DateTime _latestDialogueUtc = DateTime.MinValue;
+    private static string _latestFlowId = "";
+    private static string _latestCardType = "";
+    private static string _latestSpeakerId = "";
+    private static string _latestSpeakerName = "";
+    private static string _latestStandardType = "";
+    private static DateTime _lastLiveFixEventUtc = DateTime.MinValue;
+    private static string _lastLiveFixEventKey = "";
+    private static DateTime _lastLiveFixCommandPollUtc = DateTime.MinValue;
+    private static DateTime _lastLiveFixCommandWriteUtc = DateTime.MinValue;
+    private static string _lastLiveFixCommandRequestId = "";
     private static string _cardShownAppearanceId = "";
     private static int _cardShownAppearanceStopGeneration = -1;
     private static bool _cardShownAppearanceQueuedOrPlayed;
@@ -83,7 +109,10 @@ public class VoiceOverridePlugin : BasePlugin
     private const int ImmediateDuplicateSuppressMs = 500;
     private const int CardShownFallbackDelayMs = 175;
     private const int DefaultVoicePackUpdateToastRepeatMinutes = 30;
+    private const float DefaultVoicePackUpdateToastSeconds = 14f;
     private const string LatestDialogueReportFileName = "ZERO_PARADES_latest_dialogue_report.txt";
+    private const int LiveFixDuplicateEventSuppressMs = 250;
+    private const int LiveFixCommandPollMs = 250;
     private const uint SND_ASYNC = 0x0001;
     private const uint SND_NODEFAULT = 0x0002;
     private const uint SND_FILENAME = 0x00020000;
@@ -98,12 +127,16 @@ public class VoiceOverridePlugin : BasePlugin
         if (!string.IsNullOrWhiteSpace(OverrideRoot)) Directory.CreateDirectory(OverrideRoot);
         if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)) Directory.CreateDirectory(ExtraOverrideRoot);
         if (!string.IsNullOrWhiteSpace(NarratorOverrideRoot)) Directory.CreateDirectory(NarratorOverrideRoot);
+        if (!string.IsNullOrWhiteSpace(LiveFixRoot)) Directory.CreateDirectory(LiveFixRoot);
+        if (!string.IsNullOrWhiteSpace(LiveFixOverrideRoot)) Directory.CreateDirectory(LiveFixOverrideRoot);
         LogPath = Path.Combine(logDir, "voice-override.log");
-        File.AppendAllText(LogPath, $"\n=== ZERO PARADES Voice Override v0.3.15 loaded {DateTime.Now:O} ===\n");
+        File.AppendAllText(LogPath, $"\n=== ZERO PARADES Voice Override v0.3.21 loaded {DateTime.Now:O} ===\n");
         WriteLog($"OverrideRoot={OverrideRoot}");
         WriteLog($"ExtraOverrideRoot={ExtraOverrideRoot}");
         WriteLog($"NarratorOverrideRoot={NarratorOverrideRoot}");
-        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} extraVoices={ExtraVoicesEnabled} narratorMissingVoices={NarratorMissingVoicesEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} debugToasts={DebugToastsEnabled} updateToasts={VoicePackUpdateToastsEnabled} updateRepeatMinutes={GetVoicePackUpdateToastRepeatMinutes()} profile={_overrideProfile} presetKey={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} toggleExtras={GetConfiguredKeyName(_toggleExtraVoicesKeyEntry)} toggleNarrator={GetConfiguredKeyName(_toggleNarratorMissingVoicesKeyEntry)} reportLatest={GetConfiguredKeyName(_reportLatestDialogueKeyEntry)} updateToast=F11 debugToast=F12");
+        WriteLog($"LiveFixRoot={LiveFixRoot}");
+        WriteLog($"LiveFixOverrideRoot={LiveFixOverrideRoot}");
+        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} extraVoices={ExtraVoicesEnabled} narratorMissingVoices={NarratorMissingVoicesEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} useFmodStreaming={UseFmodStreaming} debugToasts={DebugToastsEnabled} updateToasts={VoicePackUpdateToastsEnabled} updateRepeatMinutes={GetVoicePackUpdateToastRepeatMinutes()} liveFix={LiveFixEnabled} liveFixSkipOriginal={LiveFixSkipOriginal} profile={_overrideProfile} presetKey={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} toggleExtras={GetConfiguredKeyName(_toggleExtraVoicesKeyEntry)} toggleNarrator={GetConfiguredKeyName(_toggleNarratorMissingVoicesKeyEntry)} reportLatest={GetConfiguredKeyName(_reportLatestDialogueKeyEntry)} liveFixMark={GetConfiguredKeyName(_liveFixMarkKeyEntry)} liveFixReplay={GetConfiguredKeyName(_liveFixReplayKeyEntry)} liveFixToggle={GetConfiguredKeyName(_liveFixToggleKeyEntry)} updateToast={GetConfiguredKeyName(_toggleVoicePackUpdateToastsKeyEntry)} debugToast={GetConfiguredKeyName(_toggleDebugToastsKeyEntry)}");
         StartVoicePackUpdateCheck("LOAD", force: true);
         LoadSilentCardIndex();
         try
@@ -122,7 +155,7 @@ public class VoiceOverridePlugin : BasePlugin
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "FireVOEvent", typeof(Patch_FireVOEvent), nameof(Patch_FireVOEvent.Prefix));
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "FireStopVOEvent", typeof(Patch_FireStopVOEvent), nameof(Patch_FireStopVOEvent.Prefix));
         Patch("ZAUM.FELD.C4.Dialogues.Management.C4DialogueManager", "BeforeUpdateConversation", typeof(Patch_BeforeUpdateConversation), nameof(Patch_BeforeUpdateConversation.Prefix));
-        WriteLog("PLUGIN_READY v0.3.15");
+        WriteLog("PLUGIN_READY v0.3.21");
     }
 
     private void Patch(string typeName, string methodName, Type patchType, string patchMethod)
@@ -182,6 +215,11 @@ public class VoiceOverridePlugin : BasePlugin
             "AllowOriginalVoiceWhenOverrideFails",
             true,
             "If true, the game's original VO is allowed if an override file exists but cannot be played.");
+        _useFmodStreamingEntry = Config.Bind(
+            "Audio",
+            "UseFmodStreaming",
+            true,
+            "If true, external WAV/OGG files are opened with FMOD.CREATESTREAM instead of FMOD.CREATESAMPLE to reduce per-line load hitches.");
         _voicePackUpdateToastsEnabledEntry = Config.Bind(
             "Runtime",
             "VoicePackUpdateToastsEnabled",
@@ -192,6 +230,21 @@ public class VoiceOverridePlugin : BasePlugin
             "VoicePackUpdateToastRepeatMinutes",
             DefaultVoicePackUpdateToastRepeatMinutes,
             "How often to repeat the voice-pack update toast while updates are available.");
+        _liveFixEnabledEntry = Config.Bind(
+            "LiveFix",
+            "LiveFixEnabled",
+            true,
+            "If true, write live dialogue events and check the live-fix override folder before shipped voice packs.");
+        _liveFixSkipOriginalEntry = Config.Bind(
+            "LiveFix",
+            "LiveFixSkipOriginal",
+            true,
+            "If true, a live-fix WAV suppresses the original game VO when a VO event exists.");
+        _liveFixRootEntry = Config.Bind(
+            "LiveFix",
+            "LiveFixRoot",
+            "voice-live-fix",
+            "Live repair workspace. Relative paths are resolved under BepInEx.");
         _overrideProfileEntry = Config.Bind(
             "Profiles",
             "OverrideProfile",
@@ -247,6 +300,26 @@ public class VoiceOverridePlugin : BasePlugin
             "ToggleVoicePackUpdateToastsKey",
             KeyCode.F11,
             "Runtime hotkey for toggling recurring voice-pack update toasts. Set to None to disable.");
+        _toggleDebugToastsKeyEntry = Config.Bind(
+            "Hotkeys",
+            "ToggleDebugToastsKey",
+            KeyCode.F12,
+            "Runtime hotkey for toggling debug playback toasts. Set to None to disable.");
+        _liveFixMarkKeyEntry = Config.Bind(
+            "Hotkeys",
+            "LiveFixMarkKey",
+            KeyCode.F6,
+            "Runtime hotkey for sending/marking the latest dialogue in the live-fix tool. Set to None to disable.");
+        _liveFixReplayKeyEntry = Config.Bind(
+            "Hotkeys",
+            "LiveFixReplayKey",
+            KeyCode.F7,
+            "Runtime hotkey for replaying the latest live-fix/override WAV. Set to None to disable.");
+        _liveFixToggleKeyEntry = Config.Bind(
+            "Hotkeys",
+            "LiveFixToggleKey",
+            KeyCode.F8,
+            "Runtime hotkey for toggling live-fix event capture and live override lookup. Set to None to disable.");
 
         if (_toggleOverrideKeyEntry.Value == KeyCode.F8) _toggleOverrideKeyEntry.Value = KeyCode.F1;
         if (_cycleProfileKeyEntry.Value == KeyCode.F10) _cycleProfileKeyEntry.Value = KeyCode.F2;
@@ -256,7 +329,10 @@ public class VoiceOverridePlugin : BasePlugin
         NarratorMissingVoicesEnabled = _narratorMissingVoicesEnabledEntry.Value;
         OriginalVoiceEnabledForOverrides = _originalVoiceEnabledEntry.Value;
         AllowOriginalOnOverrideFailure = _allowOriginalOnOverrideFailureEntry.Value;
+        UseFmodStreaming = _useFmodStreamingEntry.Value;
         VoicePackUpdateToastsEnabled = _voicePackUpdateToastsEnabledEntry.Value;
+        LiveFixEnabled = _liveFixEnabledEntry.Value;
+        LiveFixSkipOriginal = _liveFixSkipOriginalEntry.Value;
         _overrideProfile = NormalizeProfile(_overrideProfileEntry.Value);
         _overrideProfileEntry.Value = _overrideProfile;
     }
@@ -291,9 +367,16 @@ public class VoiceOverridePlugin : BasePlugin
         }
         ExtraOverrideRoot = ResolveBepInExPath(_extraOverrideRootEntry?.Value, "voice-override-extras");
         NarratorOverrideRoot = ResolveBepInExPath(_narratorOverrideRootEntry?.Value, "voice-override-narrator");
+        LiveFixRoot = ResolveBepInExPath(_liveFixRootEntry?.Value, "voice-live-fix");
+        LiveFixOverrideRoot = Path.Combine(LiveFixRoot, "overrides");
+        LiveFixEventsPath = Path.Combine(LiveFixRoot, "events.jsonl");
+        LiveFixLatestPath = Path.Combine(LiveFixRoot, "latest-dialogue.json");
+        LiveFixCommandPath = Path.Combine(LiveFixRoot, "command.json");
         try { if (!string.IsNullOrWhiteSpace(OverrideRoot)) Directory.CreateDirectory(OverrideRoot); } catch { }
         try { if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)) Directory.CreateDirectory(ExtraOverrideRoot); } catch { }
         try { if (!string.IsNullOrWhiteSpace(NarratorOverrideRoot)) Directory.CreateDirectory(NarratorOverrideRoot); } catch { }
+        try { if (!string.IsNullOrWhiteSpace(LiveFixRoot)) Directory.CreateDirectory(LiveFixRoot); } catch { }
+        try { if (!string.IsNullOrWhiteSpace(LiveFixOverrideRoot)) Directory.CreateDirectory(LiveFixOverrideRoot); } catch { }
     }
 
     private static string ResolveBepInExPath(string? configured, string fallback)
@@ -371,7 +454,7 @@ public class VoiceOverridePlugin : BasePlugin
                 return;
             }
 
-            var changed = new List<string>();
+            var changed = new List<VoicePackUpdateInfo>();
             foreach (var pack in installedPacks)
             {
                 try
@@ -391,12 +474,18 @@ public class VoiceOverridePlugin : BasePlugin
 
                     if (IsVoicePackRemoteChanged(pack, remote))
                     {
-                        changed.Add(pack.DisplayName);
-                        WriteLog($"VOICE_PACK_UPDATE_AVAILABLE {pack.Name} etag={remote.Etag} length={remote.ContentLength} modified={remote.LastModified}");
+                        var update = new VoicePackUpdateInfo
+                        {
+                            Name = pack.Name,
+                            DisplayName = pack.DisplayName,
+                            Message = NormalizeUpdateMessage(remote.UpdateMessage),
+                        };
+                        changed.Add(update);
+                        WriteLog($"VOICE_PACK_UPDATE_AVAILABLE {pack.Name} installedManifest={pack.ManifestHash} remoteManifest={remote.ManifestHash} installedVersion={pack.ManifestVersion} remoteVersion={remote.ManifestVersion} message={(!string.IsNullOrWhiteSpace(update.Message))} etag={remote.Etag} length={remote.ContentLength} modified={remote.LastModified}");
                     }
                     else
                     {
-                        WriteLog($"VOICE_PACK_UPDATE_CURRENT {pack.Name}");
+                        WriteLog($"VOICE_PACK_UPDATE_CURRENT {pack.Name} manifest={remote.ManifestHash} version={remote.ManifestVersion} installedManifest={pack.ManifestHash} installedVersion={pack.ManifestVersion}");
                     }
                 }
                 catch (Exception ex)
@@ -411,6 +500,7 @@ public class VoiceOverridePlugin : BasePlugin
                 _nextVoicePackUpdateToastUtc = DateTime.MinValue;
                 _voicePackUpdateCheckRunning = false;
             }
+            if (changed.Count > 0) WriteLog($"VOICE_PACK_UPDATE_TOAST_READY source={source} packs={string.Join(",", changed.Select(item => item.Name))}");
         }
         catch (Exception ex)
         {
@@ -454,6 +544,8 @@ public class VoiceOverridePlugin : BasePlugin
                     Etag = GetJsonString(pack, "etag"),
                     LastModified = GetJsonString(pack, "lastModified"),
                     ContentLength = GetJsonInt64(pack, "contentLength"),
+                    ManifestHash = GetJsonString(pack, "manifestHash"),
+                    ManifestVersion = GetJsonString(pack, "manifestVersion"),
                 });
             }
         }
@@ -497,12 +589,14 @@ public class VoiceOverridePlugin : BasePlugin
         System.Net.HttpWebResponse? response = null;
         try
         {
-            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            var requestUrl = AddNoCacheQuery(url);
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(requestUrl);
             request.Method = "HEAD";
-            request.UserAgent = "ZeroParadesVoiceOverride/0.3.13";
+            request.UserAgent = "ZeroParadesVoiceOverride/0.3.21";
             request.AllowAutoRedirect = true;
             request.Timeout = 15000;
             request.ReadWriteTimeout = 30000;
+            PrepareNoCacheRequest(request);
 
             response = (System.Net.HttpWebResponse)request.GetResponse();
             var lastModified = "";
@@ -515,12 +609,14 @@ public class VoiceOverridePlugin : BasePlugin
             }
             catch { }
 
-            return new RemoteVoicePackMetadata
+            var metadata = new RemoteVoicePackMetadata
             {
                 Etag = response.Headers["ETag"] ?? "",
                 LastModified = lastModified,
                 ContentLength = response.ContentLength,
             };
+            FillRemoteManifestMetadata(url, metadata);
+            return metadata;
         }
         catch (Exception ex)
         {
@@ -533,8 +629,67 @@ public class VoiceOverridePlugin : BasePlugin
         }
     }
 
+    private static string AddNoCacheQuery(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url)) return url;
+        var separator = url.IndexOf('?') >= 0 ? "&" : "?";
+        return $"{url}{separator}zpv_update_check={DateTime.UtcNow.Ticks}";
+    }
+
+    private static void PrepareNoCacheRequest(System.Net.HttpWebRequest request)
+    {
+        try { request.CachePolicy = new System.Net.Cache.RequestCachePolicy(System.Net.Cache.RequestCacheLevel.NoCacheNoStore); } catch { }
+        try { request.Headers["Cache-Control"] = "no-cache, no-store, must-revalidate"; } catch { }
+        try { request.Headers["Pragma"] = "no-cache"; } catch { }
+    }
+
+    private static void FillRemoteManifestMetadata(string url, RemoteVoicePackMetadata metadata)
+    {
+        if (string.IsNullOrWhiteSpace(url) || url.IndexOf(".json", StringComparison.OrdinalIgnoreCase) < 0) return;
+
+        System.Net.HttpWebResponse? response = null;
+        try
+        {
+            var requestUrl = AddNoCacheQuery(url);
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(requestUrl);
+            request.Method = "GET";
+            request.UserAgent = "ZeroParadesVoiceOverride/0.3.21";
+            request.AllowAutoRedirect = true;
+            request.Timeout = 15000;
+            request.ReadWriteTimeout = 30000;
+            PrepareNoCacheRequest(request);
+            response = (System.Net.HttpWebResponse)request.GetResponse();
+            using var stream = response.GetResponseStream();
+            if (stream == null) return;
+            using var reader = new StreamReader(stream);
+            using var doc = JsonDocument.Parse(reader.ReadToEnd());
+            var root = doc.RootElement;
+            metadata.ManifestHash = GetJsonString(root, "manifestHash");
+            metadata.ManifestVersion = GetJsonString(root, "version");
+            metadata.UpdateMessage = GetJsonString(root, "updateMessage");
+            if (string.IsNullOrWhiteSpace(metadata.UpdateMessage)) metadata.UpdateMessage = GetJsonString(root, "releaseNotes");
+            if (string.IsNullOrWhiteSpace(metadata.UpdateMessage)) metadata.UpdateMessage = GetJsonString(root, "changelog");
+            metadata.FileCount = GetJsonInt64(root, "fileCount");
+            metadata.ShardCount = GetJsonInt64(root, "shardCount");
+            metadata.TotalBytes = GetJsonInt64(root, "totalBytes");
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"VOICE_PACK_UPDATE_MANIFEST_READ_FAIL {url}: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            try { response?.Dispose(); } catch { }
+        }
+    }
+
     private static bool IsVoicePackRemoteChanged(InstalledVoicePackState installed, RemoteVoicePackMetadata remote)
     {
+        if (!string.IsNullOrWhiteSpace(installed.ManifestHash) && !string.IsNullOrWhiteSpace(remote.ManifestHash))
+        {
+            return !string.Equals(installed.ManifestHash, remote.ManifestHash, StringComparison.Ordinal);
+        }
+
         if (!string.IsNullOrWhiteSpace(installed.Etag) && !string.IsNullOrWhiteSpace(remote.Etag))
         {
             return !string.Equals(installed.Etag, remote.Etag, StringComparison.Ordinal);
@@ -553,19 +708,32 @@ public class VoiceOverridePlugin : BasePlugin
         return false;
     }
 
-    private static string BuildVoicePackUpdateToast(List<string> changedPacks)
+    private static string NormalizeUpdateMessage(string message)
     {
+        message = message.Replace("\r\n", "\n").Replace('\r', '\n').Trim();
+        if (message.Length > 520) message = message.Substring(0, 517).TrimEnd() + "...";
+        return message;
+    }
+
+    private static string BuildVoicePackUpdateToast(List<VoicePackUpdateInfo> changedPacks)
+    {
+        var messages = changedPacks
+            .Where(pack => !string.IsNullOrWhiteSpace(pack.Message))
+            .Select(pack => changedPacks.Count == 1 ? pack.Message : $"{pack.DisplayName}: {pack.Message}")
+            .ToList();
+        var messageSuffix = messages.Count == 0 ? "" : "\n\nWhat's new:\n" + string.Join("\n\n", messages);
+
         if (changedPacks.Count == 1)
         {
-            return $"Voice line update available: {changedPacks[0]}. Run Install.bat.";
+            return $"Voice line update available: {changedPacks[0].DisplayName}. Run Install.bat.{messageSuffix}";
         }
 
         if (changedPacks.Count <= 3)
         {
-            return $"Voice line updates available: {string.Join(", ", changedPacks)}. Run Install.bat.";
+            return $"Voice line updates available: {string.Join(", ", changedPacks.Select(pack => pack.DisplayName))}. Run Install.bat.{messageSuffix}";
         }
 
-        return $"Voice line updates available for {changedPacks.Count} packs. Run Install.bat.";
+        return $"Voice line updates available for {changedPacks.Count} packs. Run Install.bat.{messageSuffix}";
     }
 
     internal static void PollVoicePackUpdateNotifications()
@@ -588,7 +756,7 @@ public class VoiceOverridePlugin : BasePlugin
             _nextVoicePackUpdateToastUtc = now.AddMinutes(GetVoicePackUpdateToastRepeatMinutes());
         }
 
-        ShowToast(message);
+        ShowToast(message, DefaultVoicePackUpdateToastSeconds);
     }
 
     private static void SetVoicePackUpdateToastsEnabled(bool enabled, string source)
@@ -845,16 +1013,17 @@ public class VoiceOverridePlugin : BasePlugin
     {
         var id = CardIdFromRtCard(card);
         if (string.IsNullOrWhiteSpace(id)) return;
-        TrackLatestDialogue(source, id, DialogueTextFromRtCard(card));
+        UpdateLatestDialogueMetadata(card);
+        TrackLatestDialogue(source, id, DialogueTextFromRtCard(card), card);
     }
 
     private static void TrackLatestDialogueId(string source, string? id)
     {
         if (string.IsNullOrWhiteSpace(id)) return;
-        TrackLatestDialogue(source, id, null);
+        TrackLatestDialogue(source, id, null, null);
     }
 
-    private static void TrackLatestDialogue(string source, string id, string? text)
+    private static void TrackLatestDialogue(string source, string id, string? text, object? card)
     {
         var cleanedText = CleanDialogueText(text);
         if (!string.IsNullOrWhiteSpace(cleanedText))
@@ -870,6 +1039,137 @@ public class VoiceOverridePlugin : BasePlugin
         _latestDialogueText = cleanedText ?? "";
         _latestDialogueSource = source;
         _latestDialogueUtc = DateTime.UtcNow;
+        WriteLiveFixDialogueEvent("dialogue_seen", source, id, cleanedText, card, force: false);
+    }
+
+    private static void UpdateLatestDialogueMetadata(object? card)
+    {
+        if (card == null) return;
+
+        var flowId = FirstMemberString(card, "FlowId", "flowId", "m_flowId");
+        if (!string.IsNullOrWhiteSpace(flowId)) _latestFlowId = flowId;
+
+        var cardType = FirstMemberString(card, "CardType", "cardType", "m_cardType");
+        if (!string.IsNullOrWhiteSpace(cardType)) _latestCardType = cardType;
+
+        var standardType = FirstMemberString(card, "StandardType", "standardType");
+        if (!string.IsNullOrWhiteSpace(standardType)) _latestStandardType = standardType;
+
+        var speakerId = FirstMemberString(card, "EntityId", "entityId", "m_entityId", "SpeakerId", "speakerId");
+        if (!string.IsNullOrWhiteSpace(speakerId)) _latestSpeakerId = speakerId;
+
+        var speakerObject = TryGetMemberObject(card, "Speaker")
+            ?? TryGetMemberObject(card, "speaker")
+            ?? TryGetMemberObject(card, "Entity")
+            ?? TryGetMemberObject(card, "entity");
+        var speakerName = FirstMemberString(speakerObject, "FullName", "fullName", "Name", "name", "ShortName", "shortName", "m_shortName");
+        if (!string.IsNullOrWhiteSpace(speakerName)) _latestSpeakerName = speakerName;
+    }
+
+    private static string FirstMemberString(object? obj, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var value = CleanDialogueText(TryGetMemberString(obj, name));
+            if (!string.IsNullOrWhiteSpace(value)) return value;
+        }
+        return "";
+    }
+
+    private static bool SourceImpliesOriginalVo(string source)
+    {
+        return source.IndexOf("PlayVO", StringComparison.OrdinalIgnoreCase) >= 0
+            || source.IndexOf("FireVOEvent", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static void WriteLiveFixDialogueEvent(string kind, string source, string id, string? text, object? card, bool force)
+    {
+        if (!LiveFixEnabled || string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(LiveFixEventsPath)) return;
+
+        try
+        {
+            UpdateLatestDialogueMetadata(card);
+            Directory.CreateDirectory(LiveFixRoot);
+            Directory.CreateDirectory(LiveFixOverrideRoot);
+
+            var now = DateTime.UtcNow;
+            var cleanedText = CleanDialogueText(text) ?? _latestDialogueText;
+            var eventKey = $"{kind}|{source}|{id}|{cleanedText}|{_latestFlowId}|{_latestSpeakerId}";
+            if (!force
+                && string.Equals(eventKey, _lastLiveFixEventKey, StringComparison.Ordinal)
+                && (now - _lastLiveFixEventUtc).TotalMilliseconds < LiveFixDuplicateEventSuppressMs)
+            {
+                return;
+            }
+
+            _lastLiveFixEventKey = eventKey;
+            _lastLiveFixEventUtc = now;
+
+            var liveFile = FindLiveFixOverrideFile(id);
+            var record = new Dictionary<string, object?>
+            {
+                ["kind"] = kind,
+                ["seen_at_utc"] = now.ToString("O"),
+                ["source"] = source,
+                ["card_id"] = id,
+                ["text"] = cleanedText ?? "",
+                ["flow_id"] = _latestFlowId,
+                ["card_type"] = _latestCardType,
+                ["standard_type"] = _latestStandardType,
+                ["speaker_id"] = _latestSpeakerId,
+                ["speaker_name"] = _latestSpeakerName,
+                ["had_original_vo_guess"] = SourceImpliesOriginalVo(source),
+                ["preset"] = CurrentPresetName(),
+                ["override_enabled"] = OverrideEnabled,
+                ["redub_profile"] = _overrideProfile,
+                ["extras_enabled"] = ExtraVoicesEnabled,
+                ["narrator_missing_enabled"] = NarratorMissingVoicesEnabled,
+                ["live_fix_enabled"] = LiveFixEnabled,
+                ["live_override_wav"] = liveFile ?? "",
+                ["live_fix_root"] = LiveFixRoot,
+            };
+            var json = JsonSerializer.Serialize(record);
+            File.AppendAllText(LiveFixEventsPath, json + Environment.NewLine);
+            File.WriteAllText(LiveFixLatestPath, json);
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"LIVE_FIX_EVENT_WRITE_FAIL {id}: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void WriteLiveFixPlaybackEvent(string source, string id, string playedSource, string file, bool skippedOriginal)
+    {
+        if (!LiveFixEnabled || string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(LiveFixEventsPath)) return;
+
+        try
+        {
+            Directory.CreateDirectory(LiveFixRoot);
+            var record = new Dictionary<string, object?>
+            {
+                ["kind"] = "playback",
+                ["seen_at_utc"] = DateTime.UtcNow.ToString("O"),
+                ["source"] = source,
+                ["card_id"] = id,
+                ["text"] = _latestDialogueText,
+                ["flow_id"] = _latestFlowId,
+                ["card_type"] = _latestCardType,
+                ["standard_type"] = _latestStandardType,
+                ["speaker_id"] = _latestSpeakerId,
+                ["speaker_name"] = _latestSpeakerName,
+                ["had_original_vo_guess"] = SourceImpliesOriginalVo(source),
+                ["played_source"] = playedSource,
+                ["played_wav"] = file,
+                ["skipped_original"] = skippedOriginal,
+                ["preset"] = CurrentPresetName(),
+                ["redub_profile"] = _overrideProfile,
+            };
+            File.AppendAllText(LiveFixEventsPath, JsonSerializer.Serialize(record) + Environment.NewLine);
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"LIVE_FIX_PLAYBACK_WRITE_FAIL {id}: {ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     private static void ReportLatestDialogue(string source)
@@ -917,6 +1217,10 @@ public class VoiceOverridePlugin : BasePlugin
             $"Dialogue ID: {_latestDialogueId}",
             "Dialogue text:",
             text,
+            $"Flow ID: {_latestFlowId}",
+            $"Card type: {_latestCardType}",
+            $"Speaker ID: {_latestSpeakerId}",
+            $"Speaker name: {_latestSpeakerName}",
             $"Captured by: {_latestDialogueSource}",
             $"Captured local time: {capturedLocal}",
             $"Captured UTC: {capturedUtc}",
@@ -933,6 +1237,10 @@ public class VoiceOverridePlugin : BasePlugin
             $"Female redub root: {femaleRoot}",
             $"Extras root: {ExtraOverrideRoot}",
             $"Narrator missing VO root: {NarratorOverrideRoot}",
+            $"Live-fix enabled: {LiveFixEnabled}",
+            $"Live-fix root: {LiveFixRoot}",
+            $"Live-fix override root: {LiveFixOverrideRoot}",
+            $"Live-fix events: {LiveFixEventsPath}",
             $"Plugin log: {LogPath}"
         });
     }
@@ -961,6 +1269,12 @@ public class VoiceOverridePlugin : BasePlugin
     internal static string? FindOverrideFile(string id)
     {
         return FindOverrideFile(id, EnumerateOverrideRoots());
+    }
+
+    private static string? FindLiveFixOverrideFile(string id)
+    {
+        if (!LiveFixEnabled || string.IsNullOrWhiteSpace(LiveFixOverrideRoot)) return null;
+        return FindOverrideFile(id, new[] { LiveFixOverrideRoot });
     }
 
     private static string? FindOverrideFile(string id, IEnumerable<string> roots)
@@ -994,6 +1308,8 @@ public class VoiceOverridePlugin : BasePlugin
 
     private static string? FindReplacementVoiceFile(string id)
     {
+        var live = FindLiveFixOverrideFile(id);
+        if (live != null) return live;
         if (!IsRedubEnabled()) return null;
         return FindOverrideFile(id, EnumerateOverrideRoots());
     }
@@ -1001,6 +1317,13 @@ public class VoiceOverridePlugin : BasePlugin
     private static string? FindMissingVoiceFile(string id, out string source)
     {
         source = "";
+        var live = FindLiveFixOverrideFile(id);
+        if (live != null)
+        {
+            source = "live-fix";
+            return live;
+        }
+
         if (!OverrideEnabled) return null;
 
         if (NarratorMissingVoicesEnabled && !string.IsNullOrWhiteSpace(NarratorOverrideRoot))
@@ -1038,6 +1361,7 @@ public class VoiceOverridePlugin : BasePlugin
 
     private static IEnumerable<string> EnumerateSilentCardIndexRoots()
     {
+        if (!string.IsNullOrWhiteSpace(LiveFixOverrideRoot)) yield return LiveFixOverrideRoot;
         if (!string.IsNullOrWhiteSpace(OverrideRoot)) yield return OverrideRoot;
         if (!string.IsNullOrWhiteSpace(ExtraOverrideRoot)
             && !string.Equals(ExtraOverrideRoot, OverrideRoot, StringComparison.OrdinalIgnoreCase))
@@ -1116,6 +1440,26 @@ public class VoiceOverridePlugin : BasePlugin
         }
         TrackLatestDialogueId(source, id);
 
+        var liveFixFile = FindLiveFixOverrideFile(id);
+        if (liveFixFile != null)
+        {
+            WriteLog($"{source} PLAY_LIVE_FIX {id} {liveFixFile}");
+            if (PlayExternal(liveFixFile, id))
+            {
+                MarkImmediateOverride(id);
+                ShowDebugToast($"Live-fix VO: {id}");
+                WriteLiveFixPlaybackEvent(source, id, "live-fix", liveFixFile, LiveFixSkipOriginal);
+                WriteLog(LiveFixSkipOriginal
+                    ? $"{source} LIVE_FIX_SKIP_ORIGINAL {id}"
+                    : $"{source} LIVE_FIX_ALLOW_ORIGINAL {id}");
+                return !LiveFixSkipOriginal;
+            }
+            WriteLog(AllowOriginalOnOverrideFailure
+                ? $"{source} LIVE_FIX_FAILED_ALLOW_ORIGINAL {id}"
+                : $"{source} LIVE_FIX_FAILED_SKIP_ORIGINAL {id}");
+            return AllowOriginalOnOverrideFailure || OriginalVoiceEnabledForOverrides;
+        }
+
         if (!OverrideEnabled)
         {
             WriteLog($"{source} OVERRIDE_DISABLED_ALLOW_ORIGINAL {id}");
@@ -1152,6 +1496,7 @@ public class VoiceOverridePlugin : BasePlugin
             WriteLog(OriginalVoiceEnabledForOverrides
                 ? $"{source} ALLOW_ORIGINAL {id}"
                 : $"{source} SKIP_ORIGINAL {id}");
+            WriteLiveFixPlaybackEvent(source, id, _overrideProfile, file, !OriginalVoiceEnabledForOverrides);
             return OriginalVoiceEnabledForOverrides;
         }
         WriteLog(AllowOriginalOnOverrideFailure
@@ -1167,7 +1512,7 @@ public class VoiceOverridePlugin : BasePlugin
             ObserveAudioBus(busContext);
             var id = CardIdFromRtCard(card);
             if (string.IsNullOrWhiteSpace(id)) return;
-            if (!OverrideEnabled) return;
+            TrackLatestDialogueCard(source, card);
 
             var now = DateTime.UtcNow;
             var stopGeneration = _dialogueStopGeneration;
@@ -1193,7 +1538,6 @@ public class VoiceOverridePlugin : BasePlugin
             {
                 return;
             }
-            TrackLatestDialogueCard(source, card);
 
             if (!string.Equals(_lastShownCardId, id, StringComparison.Ordinal))
             {
@@ -1218,6 +1562,7 @@ public class VoiceOverridePlugin : BasePlugin
             if (_runner != null && _runner.QueueDelayedUnityAudio(file, id, CardShownFallbackDelayMs))
             {
                 WriteLog($"{source} DELAYED_OVERRIDE {id} source={missingSource} {file}");
+                WriteLiveFixPlaybackEvent(source, id, missingSource, file, skippedOriginal: true);
                 ShowDebugToast($"Missing VO ({missingSource}): {id}");
             }
             else if (string.Equals(Path.GetExtension(file), ".wav", StringComparison.OrdinalIgnoreCase))
@@ -1225,6 +1570,7 @@ public class VoiceOverridePlugin : BasePlugin
                 WriteLog($"{source} DELAYED_FALLBACK_NATIVE {id} source={missingSource} {file}");
                 PlayWavNative(file, id);
                 MarkImmediateOverride(id);
+                WriteLiveFixPlaybackEvent(source, id, missingSource, file, skippedOriginal: true);
                 ShowDebugToast($"Missing VO ({missingSource}): {id}");
             }
         }
@@ -1263,6 +1609,8 @@ public class VoiceOverridePlugin : BasePlugin
 
     internal static void PollRuntimeHotkeys()
     {
+        PollLiveFixCommand();
+
         if (WasKeyPressed(_toggleOverrideKeyEntry))
         {
             ApplyNextPreset("HOTKEY");
@@ -1293,10 +1641,90 @@ public class VoiceOverridePlugin : BasePlugin
             ReportLatestDialogue("HOTKEY");
         }
 
-        if (WasKeyPressed(KeyCode.F12))
+        if (WasKeyPressed(_liveFixMarkKeyEntry))
+        {
+            MarkLatestDialogueForLiveFix("HOTKEY");
+        }
+
+        if (WasKeyPressed(_liveFixReplayKeyEntry))
+        {
+            ReplayLatestLiveFixDialogue("HOTKEY");
+        }
+
+        if (WasKeyPressed(_liveFixToggleKeyEntry))
+        {
+            SetLiveFixEnabled(!LiveFixEnabled, "HOTKEY");
+        }
+
+        if (WasKeyPressed(_toggleDebugToastsKeyEntry))
         {
             SetDebugToastsEnabled(!DebugToastsEnabled, "HOTKEY");
         }
+    }
+
+    private static void PollLiveFixCommand()
+    {
+        if (!LiveFixEnabled || string.IsNullOrWhiteSpace(LiveFixCommandPath)) return;
+
+        try
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastLiveFixCommandPollUtc).TotalMilliseconds < LiveFixCommandPollMs) return;
+            _lastLiveFixCommandPollUtc = now;
+            if (!File.Exists(LiveFixCommandPath)) return;
+
+            var writeUtc = File.GetLastWriteTimeUtc(LiveFixCommandPath);
+            if (writeUtc <= _lastLiveFixCommandWriteUtc) return;
+
+            using var doc = JsonDocument.Parse(File.ReadAllText(LiveFixCommandPath));
+            var root = doc.RootElement;
+            var requestId = GetJsonPropertyString(root, "request_id");
+            if (!string.IsNullOrWhiteSpace(requestId)
+                && string.Equals(requestId, _lastLiveFixCommandRequestId, StringComparison.Ordinal))
+            {
+                _lastLiveFixCommandWriteUtc = writeUtc;
+                return;
+            }
+
+            var command = GetJsonPropertyString(root, "command");
+            var cardId = GetJsonPropertyString(root, "card_id");
+            _lastLiveFixCommandWriteUtc = writeUtc;
+            _lastLiveFixCommandRequestId = requestId;
+
+            if (string.Equals(command, "replay", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(cardId)) cardId = _latestDialogueId;
+                ReplayLiveFixDialogue(cardId, "COMMAND");
+            }
+            else if (string.Equals(command, "reload", StringComparison.OrdinalIgnoreCase))
+            {
+                LoadSilentCardIndex();
+                ShowToast("Live-fix reloaded");
+                WriteLog("LIVE_FIX_COMMAND_RELOAD");
+            }
+            else if (string.Equals(command, "mark", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(cardId)) _latestDialogueId = cardId;
+                MarkLatestDialogueForLiveFix("COMMAND");
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"LIVE_FIX_COMMAND_FAIL {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static string GetJsonPropertyString(JsonElement element, string name)
+    {
+        try
+        {
+            if (element.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String)
+            {
+                return property.GetString() ?? "";
+            }
+        }
+        catch { }
+        return "";
     }
 
     private static string NextOverrideProfile()
@@ -1472,6 +1900,78 @@ public class VoiceOverridePlugin : BasePlugin
         ShowToast(enabled ? $"Narrator missing VO: ON ({FormatVoiceState()})" : $"Narrator missing VO: OFF ({FormatVoiceState()})");
     }
 
+    private static void SetLiveFixEnabled(bool enabled, string source)
+    {
+        LiveFixEnabled = enabled;
+        if (_liveFixEnabledEntry != null) _liveFixEnabledEntry.Value = enabled;
+        ResolveOverrideRoot();
+        LoadSilentCardIndex();
+        SaveConfig();
+        WriteLog($"OPTION_LIVE_FIX {enabled} source={source}");
+        ShowToast(enabled ? "Live-fix: ON" : "Live-fix: OFF");
+    }
+
+    private static void MarkLatestDialogueForLiveFix(string source)
+    {
+        if (string.IsNullOrWhiteSpace(_latestDialogueId))
+        {
+            ShowToast("Live-fix: no dialogue captured yet.", 4f);
+            WriteLog($"LIVE_FIX_MARK_EMPTY source={source}");
+            return;
+        }
+
+        WriteLiveFixDialogueEvent("manual_mark", source, _latestDialogueId, _latestDialogueText, null, force: true);
+        ShowToast($"Live-fix marked: {_latestDialogueId}", 4f);
+        WriteLog($"LIVE_FIX_MARK {source} {_latestDialogueId}");
+    }
+
+    private static void ReplayLatestLiveFixDialogue(string source)
+    {
+        ReplayLiveFixDialogue(_latestDialogueId, source);
+    }
+
+    private static void ReplayLiveFixDialogue(string id, string source)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+        {
+            ShowToast("Live-fix replay: no dialogue captured yet.", 4f);
+            WriteLog($"LIVE_FIX_REPLAY_EMPTY source={source}");
+            return;
+        }
+
+        LoadSilentCardIndex();
+        var file = FindLiveFixOverrideFile(id);
+        var playedSource = "live-fix";
+        if (file == null)
+        {
+            file = FindReplacementVoiceFile(id);
+            playedSource = string.Equals(file, FindLiveFixOverrideFile(id), StringComparison.OrdinalIgnoreCase)
+                ? "live-fix"
+                : _overrideProfile;
+        }
+        if (file == null)
+        {
+            file = FindMissingVoiceFile(id, out playedSource);
+        }
+        if (file == null)
+        {
+            ShowToast($"Live-fix replay: no WAV for {id}", 4f);
+            WriteLog($"LIVE_FIX_REPLAY_NO_FILE source={source} id={id}");
+            return;
+        }
+
+        WriteLog($"LIVE_FIX_REPLAY {source} {id} source={playedSource} {file}");
+        if (PlayExternal(file, id))
+        {
+            WriteLiveFixPlaybackEvent(source, id, playedSource, file, skippedOriginal: true);
+            ShowToast($"Live-fix replay: {id}", 3f);
+        }
+        else
+        {
+            ShowToast($"Live-fix replay failed: {id}", 4f);
+        }
+    }
+
     private static void SetDebugToastsEnabled(bool enabled, string source)
     {
         DebugToastsEnabled = enabled;
@@ -1505,22 +2005,25 @@ public class VoiceOverridePlugin : BasePlugin
             }
 
             var isReportToast = _toastMessage.IndexOf("ZERO PARADES Voice Override latest dialogue report", StringComparison.OrdinalIgnoreCase) >= 0;
+            var isUpdateToast = _toastMessage.IndexOf("Voice line update", StringComparison.OrdinalIgnoreCase) >= 0;
             var width = isReportToast
                 ? Math.Min(1200f, Math.Max(520f, Screen.width - 64f))
+                : isUpdateToast
+                    ? Math.Min(1040f, Math.Max(460f, Screen.width - 80f))
                 : Math.Min(860f, Math.Max(360f, Screen.width - 96f));
             var style = new GUIStyle(GUI.skin.box)
             {
-                fontSize = isReportToast ? 16 : 22,
-                fontStyle = isReportToast ? FontStyle.Normal : FontStyle.Bold,
-                alignment = isReportToast ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
+                fontSize = isReportToast ? 16 : isUpdateToast ? 18 : 22,
+                fontStyle = isReportToast || isUpdateToast ? FontStyle.Normal : FontStyle.Bold,
+                alignment = isReportToast || isUpdateToast ? TextAnchor.MiddleLeft : TextAnchor.MiddleCenter,
                 wordWrap = true,
             };
-            style.padding = isReportToast ? new RectOffset(26, 26, 18, 18) : new RectOffset(24, 24, 14, 14);
+            style.padding = isReportToast || isUpdateToast ? new RectOffset(26, 26, 18, 18) : new RectOffset(24, 24, 14, 14);
             style.normal.textColor = Color.white;
 
             var content = new GUIContent(_toastMessage);
-            var maxHeight = isReportToast ? Math.Max(160f, Screen.height - 56f) : 220f;
-            if (isReportToast)
+            var maxHeight = isReportToast ? Math.Max(160f, Screen.height - 56f) : isUpdateToast ? Math.Min(420f, Math.Max(180f, Screen.height - 96f)) : 220f;
+            if (isReportToast || isUpdateToast)
             {
                 for (var size = style.fontSize; size > 11 && style.CalcHeight(content, width) + 24f > maxHeight; size--)
                 {
@@ -1528,8 +2031,8 @@ public class VoiceOverridePlugin : BasePlugin
                 }
             }
 
-            var height = Math.Min(maxHeight, Math.Max(72f, style.CalcHeight(content, width) + (isReportToast ? 26f : 18f)));
-            var bottomOffset = isReportToast ? 28f : 72f;
+            var height = Math.Min(maxHeight, Math.Max(72f, style.CalcHeight(content, width) + (isReportToast || isUpdateToast ? 26f : 18f)));
+            var bottomOffset = isReportToast ? 28f : isUpdateToast ? 42f : 72f;
             var rect = new Rect((Screen.width - width) * 0.5f, Math.Max(20f, Screen.height - height - bottomOffset), width, height);
             GUI.Box(rect, content, style);
         }
@@ -1973,6 +2476,8 @@ public class VoiceOverridePlugin : BasePlugin
       public string Etag = "";
       public string LastModified = "";
       public long ContentLength = -1;
+      public string ManifestHash = "";
+      public string ManifestVersion = "";
   }
 
   private sealed class RemoteVoicePackMetadata
@@ -1980,6 +2485,19 @@ public class VoiceOverridePlugin : BasePlugin
       public string Etag = "";
       public string LastModified = "";
       public long ContentLength = -1;
+      public string ManifestHash = "";
+      public string ManifestVersion = "";
+      public string UpdateMessage = "";
+      public long FileCount = -1;
+      public long ShardCount = -1;
+      public long TotalBytes = -1;
+  }
+
+  private sealed class VoicePackUpdateInfo
+  {
+      public string Name = "";
+      public string DisplayName = "";
+      public string Message = "";
   }
 }
 
@@ -2200,10 +2718,11 @@ public sealed class VoiceOverrideRunner : MonoBehaviour
                 return false;
             }
 
-            var mode = FMOD.MODE.DEFAULT | FMOD.MODE.LOOP_OFF | FMOD.MODE._2D | FMOD.MODE.CREATESAMPLE;
+            var loadMode = VoiceOverridePlugin.UseFmodStreaming ? FMOD.MODE.CREATESTREAM : FMOD.MODE.CREATESAMPLE;
+            var mode = FMOD.MODE.DEFAULT | FMOD.MODE.LOOP_OFF | FMOD.MODE._2D | loadMode;
             var sound = default(FMOD.Sound);
             var createResult = core.createSound(pending.File, mode, out sound);
-            VoiceOverridePlugin.WriteLog($"FMOD_CREATE_SOUND {pending.Id} result={createResult} mode={mode} file={pending.File}");
+            VoiceOverridePlugin.WriteLog($"FMOD_CREATE_SOUND {pending.Id} result={createResult} loadMode={(VoiceOverridePlugin.UseFmodStreaming ? "stream" : "sample")} mode={mode} file={pending.File}");
             if (createResult != FMOD.RESULT.OK) return false;
 
             uint lengthMs = 0;

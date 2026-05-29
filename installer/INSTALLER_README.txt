@@ -22,5 +22,5 @@ Notes:
 The ZIP does not bundle BepInEx itself.
 The installer hides the BepInEx console window but keeps disk logging enabled.
 The installer window stays visible and shows download progress.
-You can rerun Install.bat later to add voice packs you skipped or update packs when the remote voice zip has changed.
+You can rerun Install.bat later to add voice packs you skipped or update packs. Manifest-based packs download only missing or changed shards.
 Voice pack install/update metadata is saved in BepInEx/config/spore.zeroparades.voicepacks.json.

@@ -14,6 +14,7 @@ $script:ProgressForm = $null
 $script:ProgressTitleLabel = $null
 $script:ProgressStatusLabel = $null
 $script:ProgressBar = $null
+$script:DefaultShardDownloadThrottle = 8
 
 function Write-InstallLog {
     param([string] $Message)
@@ -181,6 +182,15 @@ function Get-EnabledVoicePacks {
     })
 }
 
+function Count-AudioFiles {
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+    return @(Get-ChildItem -LiteralPath $Path -File -Recurse -ErrorAction SilentlyContinue | Where-Object {
+        $_.Extension -ieq ".wav" -or $_.Extension -ieq ".ogg"
+    }).Count
+}
+
 function Get-VoicePackDisplayName {
     param([object] $Pack)
 
@@ -217,11 +227,52 @@ function Get-VoicePackName {
 function Get-VoicePackUpdateUrl {
     param([object] $Pack)
 
+    $manifestUrl = Get-VoicePackManifestUrl -Pack $Pack
+    if (-not [string]::IsNullOrWhiteSpace($manifestUrl)) { return $manifestUrl }
+
     if ($Pack.PSObject.Properties.Name -contains "updateUrl") {
         $updateUrl = [string]$Pack.updateUrl
         if (-not [string]::IsNullOrWhiteSpace($updateUrl)) { return $updateUrl }
     }
     return [string]$Pack.url
+}
+
+function Get-VoicePackManifestUrl {
+    param([object] $Pack)
+
+    if ($Pack.PSObject.Properties.Name -contains "manifestUrl") {
+        $manifestUrl = [string]$Pack.manifestUrl
+        if (-not [string]::IsNullOrWhiteSpace($manifestUrl)) { return $manifestUrl }
+    }
+    return ""
+}
+
+function Get-VoicePackBaseUrl {
+    param([object] $Pack)
+
+    if ($Pack.PSObject.Properties.Name -contains "baseUrl") {
+        $baseUrl = [string]$Pack.baseUrl
+        if (-not [string]::IsNullOrWhiteSpace($baseUrl)) { return $baseUrl.TrimEnd("/") }
+    }
+    return ""
+}
+
+function Get-VoicePackParallelDownloads {
+    param([object] $Pack)
+
+    $value = $script:DefaultShardDownloadThrottle
+    if ($Pack.PSObject.Properties.Name -contains "parallelDownloads") {
+        try {
+            $configured = [int]$Pack.parallelDownloads
+            if ($configured -gt 0) { $value = $configured }
+        } catch { }
+    }
+    return [Math]::Max(1, [Math]::Min(16, $value))
+}
+
+function Test-VoicePackUsesManifest {
+    param([object] $Pack)
+    return -not [string]::IsNullOrWhiteSpace((Get-VoicePackManifestUrl -Pack $Pack))
 }
 
 function Get-VoicePackStatePath {
@@ -241,6 +292,19 @@ function Set-ObjectProperty {
     } else {
         $Object | Add-Member -NotePropertyName $Name -NotePropertyValue $Value
     }
+}
+
+function Get-ObjectPropertyValue {
+    param(
+        [object] $Object,
+        [string] $Name,
+        [object] $Default = $null
+    )
+
+    if ($null -ne $Object -and $Object.PSObject.Properties.Name -contains $Name) {
+        return $Object.PSObject.Properties[$Name].Value
+    }
+    return $Default
 }
 
 function Read-VoicePackState {
@@ -324,12 +388,35 @@ function Get-RemoteVoicePackMetadata {
             }
         } catch { }
 
+        $manifestHash = ""
+        $manifestVersion = ""
+        $fileCount = -1
+        $shardCount = -1
+        $totalBytes = -1
+        if ($Url -match "\.json(\?|$)") {
+            try {
+                $manifest = Invoke-RestMethod -Uri $Url -Method Get -Headers @{ "User-Agent" = "ZeroParadesVoiceOverrideInstaller/1.0" }
+                $manifestHash = [string](Get-ObjectPropertyValue -Object $manifest -Name "manifestHash" -Default "")
+                $manifestVersion = [string](Get-ObjectPropertyValue -Object $manifest -Name "version" -Default "")
+                $fileCount = [int](Get-ObjectPropertyValue -Object $manifest -Name "fileCount" -Default -1)
+                $shardCount = [int](Get-ObjectPropertyValue -Object $manifest -Name "shardCount" -Default -1)
+                $totalBytes = [Int64](Get-ObjectPropertyValue -Object $manifest -Name "totalBytes" -Default -1)
+            } catch {
+                Write-InstallLog "Manifest metadata read unavailable for '$DisplayName': $($_.Exception.GetType().Name): $($_.Exception.Message)"
+            }
+        }
+
         return [pscustomobject]@{
             ok = $true
             url = $Url
             etag = [string]$response.Headers["ETag"]
             lastModified = $lastModified
             contentLength = [Int64]$response.ContentLength
+            manifestHash = $manifestHash
+            manifestVersion = $manifestVersion
+            fileCount = $fileCount
+            shardCount = $shardCount
+            totalBytes = $totalBytes
             checkedAt = (Get-Date).ToUniversalTime().ToString("o")
         }
     } catch {
@@ -338,6 +425,11 @@ function Get-RemoteVoicePackMetadata {
             ok = $false
             url = $Url
             error = "$($_.Exception.GetType().Name): $($_.Exception.Message)"
+            manifestHash = ""
+            manifestVersion = ""
+            fileCount = -1
+            shardCount = -1
+            totalBytes = -1
             checkedAt = (Get-Date).ToUniversalTime().ToString("o")
         }
     } finally {
@@ -352,6 +444,14 @@ function Test-RemoteMetadataChanged {
     )
 
     if ($null -eq $Remote -or $null -eq $Installed -or $Remote.ok -ne $true) { return $false }
+
+    $remoteManifestHash = [string](Get-ObjectPropertyValue -Object $Remote -Name "manifestHash" -Default "")
+    $installedManifestHash = [string](Get-ObjectPropertyValue -Object $Installed -Name "manifestHash" -Default "")
+    if ((-not [string]::IsNullOrWhiteSpace($remoteManifestHash)) -and
+        (-not [string]::IsNullOrWhiteSpace($installedManifestHash)) -and
+        ($remoteManifestHash -ne $installedManifestHash)) {
+        return $true
+    }
 
     $remoteEtag = [string]$Remote.etag
     $installedEtag = [string]$Installed.etag
@@ -389,9 +489,12 @@ function Get-VoicePackInstallStatus {
     $displayName = Get-VoicePackDisplayName -Pack $Pack
     $destinationRelative = [string]$Pack.destination
     $destination = if ([string]::IsNullOrWhiteSpace($destinationRelative)) { "" } else { Join-Path $GameRoot $destinationRelative }
-    $wavCount = 0
+    $audioCount = 0
     if (-not [string]::IsNullOrWhiteSpace($destination) -and (Test-Path -LiteralPath $destination)) {
-        $wavCount = @(Get-ChildItem -LiteralPath $destination -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
+        $audioCount = @(
+            Get-ChildItem -LiteralPath $destination -File -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.Extension -in @(".wav", ".ogg") }
+        ).Count
     }
 
     $installed = Get-VoicePackStateEntry -State $State -Name $name
@@ -399,19 +502,19 @@ function Get-VoicePackInstallStatus {
 
     $status = "not-installed"
     $statusText = "not installed"
-    if ($wavCount -gt 0) {
+    if ($audioCount -gt 0) {
         if ($remote.ok -ne $true) {
             $status = "check-unavailable"
-            $statusText = "installed, update check unavailable, $wavCount wavs"
+            $statusText = "installed, update check unavailable, $audioCount audio files"
         } elseif ($null -eq $installed) {
             $status = "untracked"
-            $statusText = "installed but not tracked yet, $wavCount wavs"
+            $statusText = "installed but not tracked yet, $audioCount audio files"
         } elseif (Test-RemoteMetadataChanged -Remote $remote -Installed $installed) {
             $status = "update-available"
-            $statusText = "update available, $wavCount installed wavs"
+            $statusText = "update available, $audioCount installed audio files"
         } else {
             $status = "current"
-            $statusText = "up to date, $wavCount wavs"
+            $statusText = "up to date, $audioCount audio files"
         }
     }
 
@@ -420,7 +523,7 @@ function Get-VoicePackInstallStatus {
         displayName = $displayName
         status = $status
         statusText = $statusText
-        wavCount = $wavCount
+        wavCount = $audioCount
         remote = $remote
         installed = $installed
     }
@@ -729,6 +832,218 @@ function Download-File {
     }
 }
 
+function Download-FilesParallel {
+    param(
+        [object[]] $Downloads,
+        [int] $Throttle = $script:DefaultShardDownloadThrottle,
+        [string] $DisplayName = "voice pack shards"
+    )
+
+    $downloadsArray = @($Downloads)
+    if ($downloadsArray.Count -eq 0) { return @{} }
+
+    $Throttle = [Math]::Max(1, [Math]::Min(16, $Throttle))
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [Net.ServicePointManager]::DefaultConnectionLimit = [Math]::Max([Net.ServicePointManager]::DefaultConnectionLimit, $Throttle * 4)
+
+    $queue = New-Object System.Collections.Queue
+    foreach ($download in $downloadsArray) { $queue.Enqueue($download) }
+
+    $running = New-Object System.Collections.ArrayList
+    $results = @{}
+    $completedCount = 0
+    $completedBytes = [Int64]0
+    $totalBytes = [Int64]0
+    foreach ($download in $downloadsArray) {
+        if ($download.Size -gt 0) { $totalBytes += [Int64]$download.Size }
+    }
+
+    $activity = "Downloading $DisplayName"
+    Set-InstallerProgress -Title $activity -Status "Starting $($downloadsArray.Count) downloads..." -Percent 0
+
+    try {
+        while ($queue.Count -gt 0 -or $running.Count -gt 0) {
+            while ($queue.Count -gt 0 -and $running.Count -lt $Throttle) {
+                $download = $queue.Dequeue()
+                $destination = [string]$download.Destination
+                $parent = Split-Path -Parent $destination
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+
+                $tmp = "$destination.download"
+                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+
+                $client = New-Object System.Net.WebClient
+                $client.Headers.Set("User-Agent", "ZeroParadesVoiceOverrideInstaller/1.0")
+                Write-InstallLog "Queueing download $($download.Url)"
+                $task = $client.DownloadFileTaskAsync([Uri][string]$download.Url, $tmp)
+                $null = $running.Add([pscustomobject]@{
+                    Key = [string]$download.Key
+                    Url = [string]$download.Url
+                    Destination = $destination
+                    TempPath = $tmp
+                    Size = [Int64]$download.Size
+                    Client = $client
+                    Task = $task
+                    StartedAt = Get-Date
+                })
+            }
+
+            if ($running.Count -eq 0) { continue }
+
+            $tasks = @($running | ForEach-Object { $_.Task })
+            $waitIndex = [System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$tasks, 500)
+            if ($waitIndex -lt 0) {
+                $status = if ($totalBytes -gt 0) {
+                    "{0}/{1} shards, {2} of {3}" -f $completedCount, $downloadsArray.Count, (Format-ByteSize $completedBytes), (Format-ByteSize $totalBytes)
+                } else {
+                    "{0}/{1} shards complete" -f $completedCount, $downloadsArray.Count
+                }
+                $percent = if ($totalBytes -gt 0) { [int][Math]::Floor(($completedBytes * 100.0) / $totalBytes) } else { [int][Math]::Floor(($completedCount * 100.0) / $downloadsArray.Count) }
+                Set-InstallerProgress -Title $activity -Status $status -Percent $percent
+                continue
+            }
+
+            for ($i = $running.Count - 1; $i -ge 0; $i--) {
+                $state = $running[$i]
+                if (-not $state.Task.IsCompleted) { continue }
+
+                try {
+                    $state.Task.Wait()
+                } catch {
+                    throw "Failed to download $($state.Url): $($_.Exception.Message)"
+                } finally {
+                    if ($state.Client -ne $null) { $state.Client.Dispose() }
+                }
+
+                if ($state.Task.IsFaulted) {
+                    throw "Failed to download $($state.Url): $($state.Task.Exception.GetBaseException().Message)"
+                }
+                if ($state.Task.IsCanceled) {
+                    throw "Download cancelled: $($state.Url)"
+                }
+
+                if (Test-Path -LiteralPath $state.Destination) { Remove-Item -LiteralPath $state.Destination -Force }
+                Move-Item -LiteralPath $state.TempPath -Destination $state.Destination -Force
+                $completedCount++
+                if ($state.Size -gt 0) { $completedBytes += [Int64]$state.Size }
+                $results[$state.Key] = [pscustomobject]@{
+                    ok = $true
+                    url = $state.Url
+                    downloadedBytes = if ((Test-Path -LiteralPath $state.Destination -PathType Leaf)) { [Int64](Get-Item -LiteralPath $state.Destination).Length } else { [Int64]0 }
+                    downloadedAt = (Get-Date).ToUniversalTime().ToString("o")
+                }
+                $running.RemoveAt($i)
+
+                $status = if ($totalBytes -gt 0) {
+                    "{0}/{1} shards, {2} of {3}" -f $completedCount, $downloadsArray.Count, (Format-ByteSize $completedBytes), (Format-ByteSize $totalBytes)
+                } else {
+                    "{0}/{1} shards complete" -f $completedCount, $downloadsArray.Count
+                }
+                $percent = if ($totalBytes -gt 0) { [int][Math]::Floor(($completedBytes * 100.0) / $totalBytes) } else { [int][Math]::Floor(($completedCount * 100.0) / $downloadsArray.Count) }
+                Set-InstallerProgress -Title $activity -Status $status -Percent $percent
+            }
+        }
+    } catch {
+        foreach ($state in @($running)) {
+            try {
+                if ($state.Client -ne $null) {
+                    $state.Client.CancelAsync()
+                    $state.Client.Dispose()
+                }
+            } catch { }
+        }
+        throw
+    }
+
+    Set-InstallerProgress -Title $activity -Status "Downloaded $completedCount shards." -Percent 100
+    Complete-InstallerProgress -Title $activity
+    return $results
+}
+
+function Expand-ZipFast {
+    param(
+        [string] $Archive,
+        [string] $Destination
+    )
+
+    Add-Type -AssemblyName System.IO.Compression | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $destinationFull = [System.IO.Path]::GetFullPath($Destination)
+    $destinationPrefix = $destinationFull.TrimEnd('\') + '\'
+
+    $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
+
+            $relative = $entry.FullName.Replace('/', '\')
+            $target = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($destinationFull, $relative))
+            if (-not $target.StartsWith($destinationPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Refusing to extract ZIP entry outside destination: $($entry.FullName)"
+            }
+
+            if ([string]::IsNullOrEmpty($entry.Name)) {
+                New-Item -ItemType Directory -Force -Path $target | Out-Null
+                continue
+            }
+
+            $targetParent = Split-Path -Parent $target
+            New-Item -ItemType Directory -Force -Path $targetParent | Out-Null
+
+            $inputStream = $null
+            $outputStream = $null
+            try {
+                $inputStream = $entry.Open()
+                $outputStream = [System.IO.File]::Open($target, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+                $inputStream.CopyTo($outputStream)
+            } finally {
+                if ($outputStream -ne $null) { $outputStream.Dispose() }
+                if ($inputStream -ne $null) { $inputStream.Dispose() }
+            }
+
+            try {
+                [System.IO.File]::SetLastWriteTimeUtc($target, $entry.LastWriteTime.UtcDateTime)
+            } catch { }
+        }
+    } finally {
+        if ($zip -ne $null) { $zip.Dispose() }
+    }
+}
+
+function Get-FileSha256 {
+    param([string] $Path)
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Join-VoicePackRemotePath {
+    param(
+        [string] $BaseUrl,
+        [string] $Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    if ($Path -match "^https?://") { return $Path }
+    if ([string]::IsNullOrWhiteSpace($BaseUrl)) { return $Path }
+    return $BaseUrl.TrimEnd("/") + "/" + $Path.TrimStart("/")
+}
+
+function Add-UrlQueryParameter {
+    param(
+        [string] $Url,
+        [string] $Name,
+        [string] $Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url) -or [string]::IsNullOrWhiteSpace($Name) -or [string]::IsNullOrWhiteSpace($Value)) {
+        return $Url
+    }
+    if ($Url -notmatch "^https?://") { return $Url }
+    $separator = if ($Url.Contains("?")) { "&" } else { "?" }
+    return $Url + $separator + [Uri]::EscapeDataString($Name) + "=" + [Uri]::EscapeDataString($Value)
+}
+
 function Update-VoicePackState {
     param(
         [string] $GameRoot,
@@ -757,6 +1072,272 @@ function Update-VoicePackState {
     Set-ObjectProperty -Object $state.packs -Name $name -Value $metadata
     Save-VoicePackState -GameRoot $GameRoot -State $state
     Write-InstallLog "Recorded voice pack state for '$name' ($WavCount wav files)."
+}
+
+function Update-ShardedVoicePackState {
+    param(
+        [string] $GameRoot,
+        [object] $Pack,
+        [object] $Manifest,
+        [object] $ManifestMetadata,
+        [hashtable] $InstalledShards,
+        [int] $AudioCount
+    )
+
+    $name = Get-VoicePackName -Pack $Pack
+    $state = Read-VoicePackState -GameRoot $GameRoot
+    $manifestUrl = Get-VoicePackManifestUrl -Pack $Pack
+    $metadata = [pscustomobject]@{
+        name = $name
+        displayName = Get-VoicePackDisplayName -Pack $Pack
+        destination = [string]$Pack.destination
+        format = "sharded-zip"
+        url = [string]$Pack.url
+        manifestUrl = $manifestUrl
+        updateUrl = $manifestUrl
+        manifestHash = [string](Get-ObjectPropertyValue -Object $Manifest -Name "manifestHash" -Default "")
+        manifestVersion = [string](Get-ObjectPropertyValue -Object $Manifest -Name "version" -Default "")
+        installedAt = (Get-Date).ToUniversalTime().ToString("o")
+        etag = [string]$ManifestMetadata.etag
+        lastModified = [string]$ManifestMetadata.lastModified
+        contentLength = [Int64]$ManifestMetadata.contentLength
+        downloadedBytes = [Int64]$ManifestMetadata.downloadedBytes
+        fileCount = [int](Get-ObjectPropertyValue -Object $Manifest -Name "fileCount" -Default $AudioCount)
+        shardCount = [int](Get-ObjectPropertyValue -Object $Manifest -Name "shardCount" -Default $InstalledShards.Count)
+        totalBytes = [Int64](Get-ObjectPropertyValue -Object $Manifest -Name "totalBytes" -Default -1)
+        wavCount = $AudioCount
+        renamedCount = 0
+        shards = [pscustomobject]@{}
+    }
+
+    foreach ($key in ($InstalledShards.Keys | Sort-Object)) {
+        Set-ObjectProperty -Object $metadata.shards -Name $key -Value $InstalledShards[$key]
+    }
+
+    Set-ObjectProperty -Object $state.packs -Name $name -Value $metadata
+    Save-VoicePackState -GameRoot $GameRoot -State $state
+    Write-InstallLog "Recorded sharded voice pack state for '$name' ($AudioCount audio files, $($InstalledShards.Count) shards)."
+}
+
+function Read-InstalledShardState {
+    param(
+        [object] $StateEntry,
+        [string] $ShardName
+    )
+
+    if ($null -eq $StateEntry -or -not ($StateEntry.PSObject.Properties.Name -contains "shards")) { return $null }
+    $shards = $StateEntry.shards
+    if ($null -eq $shards -or -not ($shards.PSObject.Properties.Name -contains $ShardName)) { return $null }
+    return $shards.PSObject.Properties[$ShardName].Value
+}
+
+function Build-ManifestFilesByShard {
+    param([object] $Manifest)
+
+    $byShard = @{}
+    $files = Get-ObjectPropertyValue -Object $Manifest -Name "files" -Default $null
+    if ($null -eq $files) { return $byShard }
+
+    foreach ($property in $files.PSObject.Properties) {
+        $entry = $property.Value
+        $shardName = [string](Get-ObjectPropertyValue -Object $entry -Name "shard" -Default "")
+        $relativePath = [string](Get-ObjectPropertyValue -Object $entry -Name "path" -Default "")
+        if ([string]::IsNullOrWhiteSpace($shardName) -or [string]::IsNullOrWhiteSpace($relativePath)) { continue }
+        if (-not $byShard.ContainsKey($shardName)) {
+            $byShard[$shardName] = New-Object System.Collections.Generic.List[string]
+        }
+        $byShard[$shardName].Add($relativePath) | Out-Null
+    }
+    return $byShard
+}
+
+function Test-ShardFilesPresent {
+    param(
+        [string] $Destination,
+        [object] $Manifest,
+        [string] $ShardName,
+        [hashtable] $FilesByShard
+    )
+
+    if (-not $FilesByShard.ContainsKey($ShardName)) { return $false }
+    foreach ($relativePath in $FilesByShard[$ShardName]) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Destination $relativePath) -PathType Leaf)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Install-ShardedVoicePack {
+    param(
+        [object] $Pack,
+        [string] $GameRoot
+    )
+
+    $name = Get-VoicePackName -Pack $Pack
+    $displayName = Get-VoicePackDisplayName -Pack $Pack
+    $manifestUrl = Get-VoicePackManifestUrl -Pack $Pack
+    $baseUrl = Get-VoicePackBaseUrl -Pack $Pack
+    $required = $false
+    if ($Pack.PSObject.Properties.Name -contains "required") { $required = [bool]$Pack.required }
+    if ([string]::IsNullOrWhiteSpace($manifestUrl) -or $manifestUrl.Contains("YOUR_NAME/YOUR_REPO")) {
+        if ($required) { throw "Required voice pack '$name' has no real manifestUrl in installer-config.json." }
+        Write-InstallLog "Skipping voice pack '$name': no manifestUrl configured."
+        return
+    }
+
+    $destinationRelative = [string]$Pack.destination
+    if ([string]::IsNullOrWhiteSpace($destinationRelative)) {
+        throw "Voice pack '$name' has no destination configured."
+    }
+
+    $destination = Join-Path $GameRoot $destinationRelative
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+
+    $safeName = $name -replace '[^\w.-]', '_'
+    $downloadRoot = Join-Path $GameRoot "_voicepack-downloads"
+    $packDownloadRoot = Join-Path $downloadRoot $safeName
+    New-Item -ItemType Directory -Force -Path $packDownloadRoot | Out-Null
+
+    $manifestPath = Join-Path $packDownloadRoot "$safeName.manifest.json"
+    $manifestMetadata = Download-File -Url $manifestUrl -Destination $manifestPath -DisplayName "$displayName manifest"
+    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $manifestFormat = [string](Get-ObjectPropertyValue -Object $manifest -Name "format" -Default "")
+    if ($manifestFormat -ne "sharded-zip") {
+        throw "Voice pack '$name' manifest format is '$manifestFormat', expected sharded-zip."
+    }
+
+    $state = Read-VoicePackState -GameRoot $GameRoot
+    $installed = Get-VoicePackStateEntry -State $state -Name $name
+    $filesByShard = Build-ManifestFilesByShard -Manifest $manifest
+    $installedShards = @{}
+    $changedShardCount = 0
+    $downloadedShardCount = 0
+    $shardPlans = New-Object System.Collections.Generic.List[object]
+    $downloadRequests = New-Object System.Collections.Generic.List[object]
+    $manifestShards = @($manifest.shards)
+    $shardIndex = 0
+
+    foreach ($shard in $manifestShards) {
+        $shardIndex++
+        $shardName = [string](Get-ObjectPropertyValue -Object $shard -Name "name" -Default "")
+        $shardPath = [string](Get-ObjectPropertyValue -Object $shard -Name "path" -Default "")
+        $shardUrl = [string](Get-ObjectPropertyValue -Object $shard -Name "url" -Default "")
+        $shardSha = [string](Get-ObjectPropertyValue -Object $shard -Name "sha256" -Default "")
+        $shardSize = [Int64](Get-ObjectPropertyValue -Object $shard -Name "size" -Default -1)
+        $shardFileCount = [int](Get-ObjectPropertyValue -Object $shard -Name "fileCount" -Default -1)
+        if ([string]::IsNullOrWhiteSpace($shardName)) { throw "Voice pack '$name' manifest has a shard with no name." }
+        if ([string]::IsNullOrWhiteSpace($shardUrl)) { $shardUrl = Join-VoicePackRemotePath -BaseUrl $baseUrl -Path $shardPath }
+        if ([string]::IsNullOrWhiteSpace($shardUrl)) { throw "Voice pack '$name' shard '$shardName' has no URL and no baseUrl." }
+        if (-not [string]::IsNullOrWhiteSpace($shardSha)) {
+            $shardUrl = Add-UrlQueryParameter -Url $shardUrl -Name "sha256" -Value $shardSha.Substring(0, [Math]::Min(16, $shardSha.Length))
+        }
+
+        if ($shardIndex -eq 1 -or ($shardIndex % 8) -eq 0 -or $shardIndex -eq $manifestShards.Count) {
+            $percent = if ($manifestShards.Count -gt 0) { [int][Math]::Floor(($shardIndex * 100.0) / $manifestShards.Count) } else { 0 }
+            Set-InstallerProgress -Title "Installing $displayName" -Status "Checking shard $shardIndex of $($manifestShards.Count)..." -Percent $percent
+        }
+
+        $existingShard = Read-InstalledShardState -StateEntry $installed -ShardName $shardName
+        $existingSha = [string](Get-ObjectPropertyValue -Object $existingShard -Name "sha256" -Default "")
+        $alreadyInstalled = (
+            (-not [string]::IsNullOrWhiteSpace($existingSha)) -and
+            ($existingSha -eq $shardSha) -and
+            (Test-ShardFilesPresent -Destination $destination -Manifest $manifest -ShardName $shardName -FilesByShard $filesByShard)
+        )
+
+        $archive = Join-Path $packDownloadRoot $shardName
+        $plan = [pscustomobject]@{
+            ShardName = $shardName
+            ShardPath = $shardPath
+            ShardUrl = $shardUrl
+            ShardSha = $shardSha
+            ShardSize = $shardSize
+            ShardFileCount = $shardFileCount
+            Archive = $archive
+            AlreadyInstalled = $alreadyInstalled
+            NeedsDownload = $false
+            Changed = (-not $alreadyInstalled)
+        }
+        $shardPlans.Add($plan) | Out-Null
+
+        if (-not $alreadyInstalled) {
+            $changedShardCount++
+            $archiveOk = $false
+            if ((Test-Path -LiteralPath $archive -PathType Leaf) -and -not [string]::IsNullOrWhiteSpace($shardSha)) {
+                $archiveOk = ((Get-FileSha256 -Path $archive) -eq $shardSha)
+            }
+            if (-not $archiveOk) {
+                $plan.NeedsDownload = $true
+                $downloadRequests.Add([pscustomobject]@{
+                    Key = $shardName
+                    Url = $shardUrl
+                    Destination = $archive
+                    Size = $shardSize
+                }) | Out-Null
+            }
+        }
+    }
+
+    if ($changedShardCount -gt 0) {
+        Write-InstallLog "Voice pack '$name' has $changedShardCount changed shards; $($downloadRequests.Count) need download."
+    }
+
+    if ($downloadRequests.Count -gt 0) {
+        $throttle = Get-VoicePackParallelDownloads -Pack $Pack
+        $null = Download-FilesParallel -Downloads @($downloadRequests.ToArray()) -Throttle $throttle -DisplayName "$displayName shards"
+        $downloadedShardCount = $downloadRequests.Count
+    }
+
+    $changedPlans = @($shardPlans | Where-Object { $_.Changed })
+    $verifyIndex = 0
+    foreach ($plan in $changedPlans) {
+        $verifyIndex++
+        if ($verifyIndex -eq 1 -or ($verifyIndex % 8) -eq 0 -or $verifyIndex -eq $changedPlans.Count) {
+            $percent = if ($changedPlans.Count -gt 0) { [int][Math]::Floor(($verifyIndex * 100.0) / $changedPlans.Count) } else { 100 }
+            Set-InstallerProgress -Title "Installing $displayName" -Status "Verifying shard $verifyIndex of $($changedPlans.Count)..." -Percent $percent
+        }
+        if (-not (Test-Path -LiteralPath $plan.Archive -PathType Leaf)) {
+            throw "Voice pack '$name' shard '$($plan.ShardName)' archive is missing after download."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($plan.ShardSha)) {
+            $actualSha = Get-FileSha256 -Path $plan.Archive
+            if ($actualSha -ne $plan.ShardSha) {
+                throw "Voice pack '$name' shard '$($plan.ShardName)' hash mismatch. Expected $($plan.ShardSha), got $actualSha."
+            }
+        }
+    }
+
+    $extractIndex = 0
+    foreach ($plan in $changedPlans) {
+        $extractIndex++
+        $percent = if ($changedPlans.Count -gt 0) { [int][Math]::Floor(($extractIndex * 100.0) / $changedPlans.Count) } else { 100 }
+        Set-InstallerProgress -Title "Installing $displayName" -Status "Extracting shard $extractIndex of $($changedPlans.Count)..." -Percent $percent
+        Expand-ZipFast -Archive $plan.Archive -Destination $destination
+    }
+
+    foreach ($plan in $shardPlans) {
+        $installedShards[$plan.ShardName] = [pscustomobject]@{
+            name = $plan.ShardName
+            path = $plan.ShardPath
+            url = $plan.ShardUrl
+            sha256 = $plan.ShardSha
+            size = $plan.ShardSize
+            fileCount = $plan.ShardFileCount
+            installedAt = (Get-Date).ToUniversalTime().ToString("o")
+        }
+    }
+
+    Set-InstallerProgress -Title "Installing $displayName" -Status "Checking filenames..." -Percent 100
+    $script:RenamedVoiceFiles = 0
+    Normalize-VoiceFileNames -Directory $destination | Out-Null
+    $audioCount = @(
+        Get-ChildItem -LiteralPath $destination -File -Recurse |
+            Where-Object { $_.Extension -in @(".wav", ".ogg") }
+    ).Count
+    Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $destination "_voice-pack-manifest.json") -Force
+    Update-ShardedVoicePackState -GameRoot $GameRoot -Pack $Pack -Manifest $manifest -ManifestMetadata $manifestMetadata -InstalledShards $installedShards -AudioCount $audioCount
+    Write-InstallLog "Installed sharded voice pack '$name' to '$destinationRelative' ($audioCount audio files, $changedShardCount changed shards, $downloadedShardCount downloaded shards)."
 }
 
 function Install-BepInExIfMissing {
@@ -819,6 +1400,10 @@ function Install-VoicePack {
     }
 
     $name = Get-VoicePackName -Pack $Pack
+    if (Test-VoicePackUsesManifest -Pack $Pack) {
+        Install-ShardedVoicePack -Pack $Pack -GameRoot $GameRoot
+        return
+    }
 
     $url = [string]$Pack.url
     $required = $false
@@ -862,9 +1447,12 @@ function Install-VoicePack {
     Set-InstallerProgress -Title "Installing $name voice pack" -Status "Checking filenames..." -Percent 100
     $script:RenamedVoiceFiles = 0
     Normalize-VoiceFileNames -Directory $destination | Out-Null
-    $wavCount = @(Get-ChildItem -LiteralPath $destination -Filter "*.wav" -File -Recurse).Count
-    Update-VoicePackState -GameRoot $GameRoot -Pack $Pack -DownloadMetadata $downloadMetadata -WavCount $wavCount -RenamedCount $script:RenamedVoiceFiles
-    Write-InstallLog "Installed voice pack '$name' to '$destinationRelative' ($wavCount wav files, $script:RenamedVoiceFiles renamed)."
+    $audioCount = @(
+        Get-ChildItem -LiteralPath $destination -File -Recurse |
+            Where-Object { $_.Extension -in @(".wav", ".ogg") }
+    ).Count
+    Update-VoicePackState -GameRoot $GameRoot -Pack $Pack -DownloadMetadata $downloadMetadata -WavCount $audioCount -RenamedCount $script:RenamedVoiceFiles
+    Write-InstallLog "Installed voice pack '$name' to '$destinationRelative' ($audioCount audio files, $script:RenamedVoiceFiles renamed)."
 }
 
 try {
@@ -914,10 +1502,10 @@ try {
         Write-InstallLog "Voice pack downloads skipped by command line."
     }
 
-    $maleCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-overrides") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
-    $femaleCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-overrides-female") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
-    $extraCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-override-extras") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
-    $narratorCount = @(Get-ChildItem -LiteralPath (Join-Path $GameDir "BepInEx/voice-override-narrator") -Filter "*.wav" -File -Recurse -ErrorAction SilentlyContinue).Count
+    $maleCount = Count-AudioFiles -Path (Join-Path $GameDir "BepInEx/voice-overrides")
+    $femaleCount = Count-AudioFiles -Path (Join-Path $GameDir "BepInEx/voice-overrides-female")
+    $extraCount = Count-AudioFiles -Path (Join-Path $GameDir "BepInEx/voice-override-extras")
+    $narratorCount = Count-AudioFiles -Path (Join-Path $GameDir "BepInEx/voice-override-narrator")
 
     $message = "Installed ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`nExtra character voices: $extraCount`nNarrator missing voices: $narratorCount`n`nF1 cycles presets. F2 cycles redub off/male/female. F3 toggles extras. F4 toggles narrator missing VO. F10 reports latest dialogue. F11 toggles update toasts. F12 toggles debug toasts."
     Write-InstallLog $message.Replace("`n", " ")

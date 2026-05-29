@@ -12,7 +12,10 @@
                            "enabled":  true,
                            "required":  true,
                            "selectedByDefault":  true,
+                           "parallelDownloads":  8,
                            "destination":  "BepInEx/voice-overrides",
+                           "baseUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main",
+                           "manifestUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/manifests/male.json?download=true",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-male.zip?download=true"
                        },
                        {
@@ -21,7 +24,10 @@
                            "enabled":  true,
                            "required":  true,
                            "selectedByDefault":  true,
+                           "parallelDownloads":  8,
                            "destination":  "BepInEx/voice-overrides-female",
+                           "baseUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main",
+                           "manifestUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/manifests/female.json?download=true",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-female.zip?download=true"
                        },
                        {
@@ -30,7 +36,10 @@
                            "enabled":  true,
                            "required":  true,
                            "selectedByDefault":  true,
+                           "parallelDownloads":  8,
                            "destination":  "BepInEx/voice-override-extras",
+                           "baseUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main",
+                           "manifestUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/manifests/extras.json?download=true",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-extras.zip?download=true"
                        },
                        {
@@ -39,7 +48,10 @@
                            "enabled":  true,
                            "required":  true,
                            "selectedByDefault":  true,
+                           "parallelDownloads":  8,
                            "destination":  "BepInEx/voice-override-narrator",
+                           "baseUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main",
+                           "manifestUrl":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/manifests/narrator.json?download=true",
                            "url":  "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main/zero-parades-voice-overrides-narrator.zip?download=true"
                        }
                    ]

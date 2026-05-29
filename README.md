@@ -17,6 +17,8 @@ installer/
   INSTALLER_README.txt
 config/
   spore.zeroparades.voiceoverride.cfg
+tools/
+  build_voice_pack_shards.py
 ```
 
 ## Build
@@ -49,11 +51,32 @@ At install time it:
 - installs/configures the voice override plugin
 - asks which configured voice packs to download
 - downloads male/female/extras/narrator voice packs from the URLs in `installer/installer-config.json`
+- supports manifest-based sharded packs and downloads only missing or changed shards on later runs
 - extracts voice packs into `BepInEx/voice-overrides`, `BepInEx/voice-overrides-female`, `BepInEx/voice-override-extras`, and `BepInEx/voice-override-narrator`
 - records installed voice-pack metadata in `BepInEx/config/spore.zeroparades.voicepacks.json`
 - checks configured remote pack metadata on later installer runs and marks packs as up to date, update available, untracked, or check unavailable
 
-Before publishing, update the voice pack URLs in `installer/installer-config.json`. If a pack's Git/raw update-check URL should differ from its download URL, add `updateUrl`; otherwise the installer checks the download URL.
+Before publishing, update the voice pack URLs in `installer/installer-config.json`. Prefer `manifestUrl` plus `baseUrl` for sharded packs; keep `url` only as a legacy full-zip fallback.
+
+To generate sharded voice packs from an installed game folder:
+
+```powershell
+python .\tools\build_voice_pack_shards.py --game-root "<path-to-game-folder>" --output "<output-folder>" --base-url "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main"
+```
+
+Use `--clean` only when you intentionally want to discard the local generated pack tree and rebuild it. For normal updates, omit `--clean`; the generator reads the previous manifests, reuses unchanged shard zips, writes only changed/new shards, and prunes stale shard zips. Shard filenames are stable (`male-b000-p00.zip`, etc.) so publishing updates overwrites the same remote paths. Content hashes are stored in the manifests. Files are assigned to stable dialogue-id hash buckets, so normal line additions or replacements only invalidate the affected bucket shard instead of reshuffling the whole pack.
+
+The builder hashes files and writes changed shard ZIPs in parallel. It defaults to up to 8 workers; use `--workers 4` or `--workers 12` to tune for your CPU/disk.
+
+After each build, `publish-changes.txt` lists the relative files that changed in the generated pack tree. Use that list when copying into the Hugging Face repository; a male-only update should normally include `manifests/male.json`, `manifest-index.json`, and only the changed `packs/male/shards/*.zip` files.
+
+To show release notes in the in-game update toast, pass a per-pack message while building:
+
+```powershell
+python .\tools\build_voice_pack_shards.py --game-root "<path-to-game-folder>" --output "<output-folder>" -c "male=Fixed 30 male narrator lines"
+```
+
+You can repeat `-c`, for example `-c "male=..." -c "extras=..."`. For longer notes, add an optional text file at `<output-folder>/update-messages/<pack>.txt`, for example `voice_packs/update-messages/male.txt`. The CLI message takes precedence. The builder stores the text as `updateMessage` in `manifests/<pack>.json`, and the mod displays it when that pack is out of date. The message is not part of the voice-file hash, so changing the note alone does not make an already-current pack look outdated.
 
 ## Controls
 
@@ -67,4 +90,4 @@ Before publishing, update the voice pack URLs in `installer/installer-config.jso
 
 The extras and narrator folders are not F2 profiles. Existing game VO is replaced only by the active male/female redub profile. Missing/silent dialogue searches `voice-override-narrator` first when enabled, then `voice-override-extras`, then the active redub profile for cards listed in a silent-card index.
 
-At game launch, the plugin reads `BepInEx/config/spore.zeroparades.voicepacks.json` and checks tracked voice pack URLs on a background thread. If remote metadata has changed, it shows a bottom-screen update toast and repeats it every `VoicePackUpdateToastRepeatMinutes` while update toasts are enabled.
+At game launch, the plugin reads `BepInEx/config/spore.zeroparades.voicepacks.json` and checks tracked voice pack URLs on a background thread. For sharded packs it compares the installed `manifestHash` against the remote manifest. If remote metadata has changed, it shows a bottom-screen update toast and repeats it every `VoicePackUpdateToastRepeatMinutes` while update toasts are enabled.
