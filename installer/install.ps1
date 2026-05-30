@@ -2,7 +2,8 @@ param(
     [string] $GameDir = "",
     [string] $ConfigPath = "",
     [switch] $Gui,
-    [switch] $SkipVoiceDownload
+    [switch] $SkipVoiceDownload,
+    [switch] $Update
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,6 +16,11 @@ $script:ProgressTitleLabel = $null
 $script:ProgressStatusLabel = $null
 $script:ProgressBar = $null
 $script:DefaultShardDownloadThrottle = 8
+
+if ($GameDir -match '^(update|--update|/update)$') {
+    $Update = $true
+    $GameDir = ""
+}
 
 function Write-InstallLog {
     param([string] $Message)
@@ -588,6 +594,48 @@ function Select-VoicePacksForDownload {
     return @($selected.ToArray())
 }
 
+function Select-VoicePacksForUpdate {
+    param(
+        [object[]] $VoicePacks,
+        [string] $GameRoot
+    )
+
+    if ($VoicePacks.Count -eq 0) { return @() }
+
+    Write-Host ""
+    Write-Host "Checking installed voice packs for updates..."
+    $state = Read-VoicePackState -GameRoot $GameRoot
+    $selected = New-Object System.Collections.Generic.List[object]
+
+    foreach ($pack in $VoicePacks) {
+        $name = Get-VoicePackName -Pack $pack
+        $displayName = Get-VoicePackDisplayName -Pack $pack
+        $status = Get-VoicePackInstallStatus -Pack $pack -GameRoot $GameRoot -State $state
+        $tracked = ($null -ne (Get-VoicePackStateEntry -State $state -Name $name))
+        $existingUntracked = ($status.status -eq "untracked")
+
+        if ($tracked -or $existingUntracked) {
+            $selected.Add($pack) | Out-Null
+            if ($status.status -eq "current") {
+                Write-InstallLog "Update mode selected '$displayName' (already tracked; will verify local shards)."
+            } else {
+                Write-InstallLog "Update mode selected '$displayName' ($($status.statusText))."
+            }
+        } else {
+            Write-InstallLog "Update mode skipped '$displayName' ($($status.statusText))."
+        }
+    }
+
+    if ($selected.Count -eq 0) {
+        Write-InstallLog "Update mode found no installed voice packs. Run Install.bat normally to choose packs."
+    } else {
+        $selectedNames = @($selected.ToArray() | ForEach-Object { Get-VoicePackDisplayName -Pack $_ })
+        Write-InstallLog "Update mode voice packs: $($selectedNames -join ', ')"
+    }
+
+    return @($selected.ToArray())
+}
+
 function Copy-DirectoryContents {
     param(
         [string] $Source,
@@ -1151,6 +1199,50 @@ function Build-ManifestFilesByShard {
     return $byShard
 }
 
+function Get-ManifestRelativePathSet {
+    param([object] $Manifest)
+
+    $set = @{}
+    $files = Get-ObjectPropertyValue -Object $Manifest -Name "files" -Default $null
+    if ($null -eq $files) { return $set }
+
+    foreach ($property in $files.PSObject.Properties) {
+        $entry = $property.Value
+        $relativePath = [string](Get-ObjectPropertyValue -Object $entry -Name "path" -Default "")
+        if ([string]::IsNullOrWhiteSpace($relativePath)) { continue }
+        $key = $relativePath.Replace("/", "\").TrimStart("\").ToLowerInvariant()
+        $set[$key] = $true
+    }
+    return $set
+}
+
+function Prune-ShardedVoicePackFiles {
+    param(
+        [string] $Destination,
+        [object] $Manifest
+    )
+
+    if (-not (Test-Path -LiteralPath $Destination -PathType Container)) { return 0 }
+
+    $expected = Get-ManifestRelativePathSet -Manifest $Manifest
+    if ($expected.Count -eq 0) { return 0 }
+
+    $destinationRoot = (Resolve-Path -LiteralPath $Destination).Path.TrimEnd("\")
+    $removed = 0
+    foreach ($file in Get-ChildItem -LiteralPath $Destination -File -Recurse -ErrorAction SilentlyContinue) {
+        $isManagedAudio = $file.Extension -in @(".wav", ".ogg")
+        $isManagedIndex = $file.Name -eq "_silent-card-ids.txt"
+        if (-not $isManagedAudio -and -not $isManagedIndex) { continue }
+        if (-not $file.FullName.StartsWith($destinationRoot, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $relativePath = $file.FullName.Substring($destinationRoot.Length).TrimStart("\").Replace("/", "\")
+        $key = $relativePath.ToLowerInvariant()
+        if ($expected.ContainsKey($key)) { continue }
+        Remove-Item -LiteralPath $file.FullName -Force
+        $removed++
+    }
+    return $removed
+}
+
 function Test-ShardFilesPresent {
     param(
         [string] $Destination,
@@ -1331,13 +1423,15 @@ function Install-ShardedVoicePack {
     Set-InstallerProgress -Title "Installing $displayName" -Status "Checking filenames..." -Percent 100
     $script:RenamedVoiceFiles = 0
     Normalize-VoiceFileNames -Directory $destination | Out-Null
+    Set-InstallerProgress -Title "Installing $displayName" -Status "Removing obsolete files..." -Percent 100
+    $prunedCount = Prune-ShardedVoicePackFiles -Destination $destination -Manifest $manifest
     $audioCount = @(
         Get-ChildItem -LiteralPath $destination -File -Recurse |
             Where-Object { $_.Extension -in @(".wav", ".ogg") }
     ).Count
     Copy-Item -LiteralPath $manifestPath -Destination (Join-Path $destination "_voice-pack-manifest.json") -Force
     Update-ShardedVoicePackState -GameRoot $GameRoot -Pack $Pack -Manifest $manifest -ManifestMetadata $manifestMetadata -InstalledShards $installedShards -AudioCount $audioCount
-    Write-InstallLog "Installed sharded voice pack '$name' to '$destinationRelative' ($audioCount audio files, $changedShardCount changed shards, $downloadedShardCount downloaded shards)."
+    Write-InstallLog "Installed sharded voice pack '$name' to '$destinationRelative' ($audioCount audio files, $changedShardCount changed shards, $downloadedShardCount downloaded shards, $prunedCount obsolete files removed)."
 }
 
 function Install-BepInExIfMissing {
@@ -1467,7 +1561,8 @@ try {
 
     Write-InstallLog "Installing to $GameDir"
     if ($Gui) {
-        Show-InstallerMessage -Message "The installer will now set up BepInEx if needed, install the mod, and download the voice packs. This can take several minutes; wait for the success message before launching the game."
+        $modeText = if ($Update) { "update the installed voice packs" } else { "download the voice packs" }
+        Show-InstallerMessage -Message "The installer will now set up BepInEx if needed, install the mod, and $modeText. This can take several minutes; wait for the success message before launching the game."
     }
 
     Install-BepInExIfMissing -Config $config -GameRoot $GameDir
@@ -1479,13 +1574,14 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $GameDir "BepInEx/voice-override-narrator") | Out-Null
 
     $pluginPath = Join-Path $GameDir "BepInEx/plugins/ZeroParadesVoiceOverride.dll"
-    if (-not (Test-Path -LiteralPath $pluginPath)) {
-        $loosePlugin = Join-Path $ScriptRoot "ZeroParadesVoiceOverride.dll"
-        if (Test-Path -LiteralPath $loosePlugin) {
-            Copy-Item -LiteralPath $loosePlugin -Destination $pluginPath -Force
-        } else {
-            throw "ZeroParadesVoiceOverride.dll was not found. Extract the ZIP into the folder that contains ZeroParades.exe and keep the BepInEx folder from the ZIP."
-        }
+    $loosePlugin = Join-Path $ScriptRoot "ZeroParadesVoiceOverride.dll"
+    if (Test-Path -LiteralPath $loosePlugin) {
+        Copy-Item -LiteralPath $loosePlugin -Destination $pluginPath -Force
+        Write-InstallLog "Installed plugin DLL to $pluginPath."
+    } elseif (-not (Test-Path -LiteralPath $pluginPath)) {
+        throw "ZeroParadesVoiceOverride.dll was not found. Extract the ZIP into the folder that contains ZeroParades.exe and keep the BepInEx folder from the ZIP."
+    } else {
+        Write-InstallLog "Plugin DLL already exists; no loose DLL was available to refresh it."
     }
 
     if ($config.disableBepInExConsole -ne $false) {
@@ -1494,7 +1590,11 @@ try {
     }
 
     if (-not $SkipVoiceDownload) {
-        $selectedVoicePacks = Select-VoicePacksForDownload -VoicePacks (Get-EnabledVoicePacks -Config $config) -GameRoot $GameDir
+        if ($Update) {
+            $selectedVoicePacks = Select-VoicePacksForUpdate -VoicePacks (Get-EnabledVoicePacks -Config $config) -GameRoot $GameDir
+        } else {
+            $selectedVoicePacks = Select-VoicePacksForDownload -VoicePacks (Get-EnabledVoicePacks -Config $config) -GameRoot $GameDir
+        }
         foreach ($pack in $selectedVoicePacks) {
             Install-VoicePack -Pack $pack -GameRoot $GameDir
         }
@@ -1507,7 +1607,8 @@ try {
     $extraCount = Count-AudioFiles -Path (Join-Path $GameDir "BepInEx/voice-override-extras")
     $narratorCount = Count-AudioFiles -Path (Join-Path $GameDir "BepInEx/voice-override-narrator")
 
-    $message = "Installed ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`nExtra character voices: $extraCount`nNarrator missing voices: $narratorCount`n`nF1 cycles presets. F2 cycles redub off/male/female. F3 toggles extras. F4 toggles narrator missing VO. F10 reports latest dialogue. F11 toggles update toasts. F12 toggles debug toasts."
+    $doneVerb = if ($Update) { "Updated" } else { "Installed" }
+    $message = "$doneVerb ZERO PARADES Voice Override.`n`nMale voices: $maleCount`nFemale voices: $femaleCount`nExtra character voices: $extraCount`nNarrator missing voices: $narratorCount`n`nF1 cycles presets. F2 cycles redub off/male/female. F3 toggles extras. F4 toggles narrator missing VO. F9 installs voice updates in game. F10 reports latest dialogue. F11 toggles update toasts. F12 toggles debug toasts."
     Write-InstallLog $message.Replace("`n", " ")
     Close-InstallerProgress
     Show-InstallerMessage -Message $message

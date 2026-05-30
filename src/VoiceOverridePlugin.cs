@@ -1,10 +1,13 @@
 using System;
+using System.IO.Compression;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Unity.IL2CPP;
@@ -61,6 +64,7 @@ public class VoiceOverridePlugin : BasePlugin
     private static ConfigEntry<KeyCode>? _toggleExtraVoicesKeyEntry;
     private static ConfigEntry<KeyCode>? _toggleNarratorMissingVoicesKeyEntry;
     private static ConfigEntry<KeyCode>? _reportLatestDialogueKeyEntry;
+    private static ConfigEntry<KeyCode>? _installVoicePackUpdatesKeyEntry;
     private static ConfigEntry<KeyCode>? _toggleVoicePackUpdateToastsKeyEntry;
     private static ConfigEntry<KeyCode>? _toggleDebugToastsKeyEntry;
     private static ConfigEntry<KeyCode>? _liveFixMarkKeyEntry;
@@ -82,10 +86,13 @@ public class VoiceOverridePlugin : BasePlugin
     private static readonly Dictionary<string, DateTime> _recentCardShownQueuesUtc = new();
     private static int _dialogueStopGeneration;
     private static readonly object _voicePackUpdateLock = new();
+    private static readonly object _voicePackInstallLock = new();
     private static bool _voicePackUpdateCheckRunning;
+    private static bool _voicePackInstallRunning;
     private static DateTime _lastVoicePackUpdateCheckUtc = DateTime.MinValue;
     private static DateTime _nextVoicePackUpdateToastUtc = DateTime.MinValue;
     private static string _voicePackUpdateToastMessage = "";
+    private static List<VoicePackUpdateInfo> _voicePackUpdatesAvailable = new();
     private static readonly Dictionary<string, string> _dialogueTextById = new(StringComparer.Ordinal);
     private static string _latestDialogueId = "";
     private static string _latestDialogueText = "";
@@ -136,7 +143,7 @@ public class VoiceOverridePlugin : BasePlugin
         WriteLog($"NarratorOverrideRoot={NarratorOverrideRoot}");
         WriteLog($"LiveFixRoot={LiveFixRoot}");
         WriteLog($"LiveFixOverrideRoot={LiveFixOverrideRoot}");
-        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} extraVoices={ExtraVoicesEnabled} narratorMissingVoices={NarratorMissingVoicesEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} useFmodStreaming={UseFmodStreaming} debugToasts={DebugToastsEnabled} updateToasts={VoicePackUpdateToastsEnabled} updateRepeatMinutes={GetVoicePackUpdateToastRepeatMinutes()} liveFix={LiveFixEnabled} liveFixSkipOriginal={LiveFixSkipOriginal} profile={_overrideProfile} presetKey={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} toggleExtras={GetConfiguredKeyName(_toggleExtraVoicesKeyEntry)} toggleNarrator={GetConfiguredKeyName(_toggleNarratorMissingVoicesKeyEntry)} reportLatest={GetConfiguredKeyName(_reportLatestDialogueKeyEntry)} liveFixMark={GetConfiguredKeyName(_liveFixMarkKeyEntry)} liveFixReplay={GetConfiguredKeyName(_liveFixReplayKeyEntry)} liveFixToggle={GetConfiguredKeyName(_liveFixToggleKeyEntry)} updateToast={GetConfiguredKeyName(_toggleVoicePackUpdateToastsKeyEntry)} debugToast={GetConfiguredKeyName(_toggleDebugToastsKeyEntry)}");
+        WriteLog($"OPTIONS overrideEnabled={OverrideEnabled} extraVoices={ExtraVoicesEnabled} narratorMissingVoices={NarratorMissingVoicesEnabled} originalVoiceWithOverride={OriginalVoiceEnabledForOverrides} allowOriginalOnFailure={AllowOriginalOnOverrideFailure} useFmodStreaming={UseFmodStreaming} debugToasts={DebugToastsEnabled} updateToasts={VoicePackUpdateToastsEnabled} updateRepeatMinutes={GetVoicePackUpdateToastRepeatMinutes()} liveFix={LiveFixEnabled} liveFixSkipOriginal={LiveFixSkipOriginal} profile={_overrideProfile} presetKey={GetConfiguredKeyName(_toggleOverrideKeyEntry)} cycleProfile={GetConfiguredKeyName(_cycleProfileKeyEntry)} toggleExtras={GetConfiguredKeyName(_toggleExtraVoicesKeyEntry)} toggleNarrator={GetConfiguredKeyName(_toggleNarratorMissingVoicesKeyEntry)} reportLatest={GetConfiguredKeyName(_reportLatestDialogueKeyEntry)} installUpdates={GetConfiguredKeyName(_installVoicePackUpdatesKeyEntry)} liveFixMark={GetConfiguredKeyName(_liveFixMarkKeyEntry)} liveFixReplay={GetConfiguredKeyName(_liveFixReplayKeyEntry)} liveFixToggle={GetConfiguredKeyName(_liveFixToggleKeyEntry)} updateToast={GetConfiguredKeyName(_toggleVoicePackUpdateToastsKeyEntry)} debugToast={GetConfiguredKeyName(_toggleDebugToastsKeyEntry)}");
         StartVoicePackUpdateCheck("LOAD", force: true);
         LoadSilentCardIndex();
         try
@@ -295,6 +302,11 @@ public class VoiceOverridePlugin : BasePlugin
             "ReportLatestDialogueKey",
             KeyCode.F10,
             "Runtime hotkey for showing and writing the latest captured dialogue report. Set to None to disable.");
+        _installVoicePackUpdatesKeyEntry = Config.Bind(
+            "Hotkeys",
+            "InstallVoicePackUpdatesKey",
+            KeyCode.F9,
+            "Runtime hotkey for downloading and installing available voice-pack updates while the game is running. Set to None to disable.");
         _toggleVoicePackUpdateToastsKeyEntry = Config.Bind(
             "Hotkeys",
             "ToggleVoicePackUpdateToastsKey",
@@ -449,6 +461,7 @@ public class VoiceOverridePlugin : BasePlugin
                 lock (_voicePackUpdateLock)
                 {
                     _voicePackUpdateToastMessage = "";
+                    _voicePackUpdatesAvailable = new List<VoicePackUpdateInfo>();
                     _voicePackUpdateCheckRunning = false;
                 }
                 return;
@@ -497,6 +510,7 @@ public class VoiceOverridePlugin : BasePlugin
             lock (_voicePackUpdateLock)
             {
                 _voicePackUpdateToastMessage = changed.Count == 0 ? "" : BuildVoicePackUpdateToast(changed);
+                _voicePackUpdatesAvailable = changed;
                 _nextVoicePackUpdateToastUtc = DateTime.MinValue;
                 _voicePackUpdateCheckRunning = false;
             }
@@ -540,12 +554,16 @@ public class VoiceOverridePlugin : BasePlugin
                 {
                     Name = name,
                     DisplayName = displayName,
+                    Destination = GetJsonString(pack, "destination"),
+                    Format = GetJsonString(pack, "format"),
+                    PackageUrl = GetJsonString(pack, "url"),
                     UpdateUrl = updateUrl,
                     Etag = GetJsonString(pack, "etag"),
                     LastModified = GetJsonString(pack, "lastModified"),
                     ContentLength = GetJsonInt64(pack, "contentLength"),
                     ManifestHash = GetJsonString(pack, "manifestHash"),
                     ManifestVersion = GetJsonString(pack, "manifestVersion"),
+                    ShardSha256 = ReadInstalledShardHashes(pack),
                 });
             }
         }
@@ -554,6 +572,23 @@ public class VoiceOverridePlugin : BasePlugin
             WriteLog($"VOICE_PACK_UPDATE_STATE_READ_FAIL {statePath}: {ex.GetType().Name}: {ex.Message}");
         }
 
+        return result;
+    }
+
+    private static Dictionary<string, string> ReadInstalledShardHashes(JsonElement pack)
+    {
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            if (!pack.TryGetProperty("shards", out var shards) || shards.ValueKind != JsonValueKind.Object) return result;
+            foreach (var shard in shards.EnumerateObject())
+            {
+                if (shard.Value.ValueKind != JsonValueKind.Object) continue;
+                var sha = GetJsonString(shard.Value, "sha256");
+                if (!string.IsNullOrWhiteSpace(sha)) result[shard.Name] = sha;
+            }
+        }
+        catch { }
         return result;
     }
 
@@ -721,19 +756,23 @@ public class VoiceOverridePlugin : BasePlugin
             .Where(pack => !string.IsNullOrWhiteSpace(pack.Message))
             .Select(pack => changedPacks.Count == 1 ? pack.Message : $"{pack.DisplayName}: {pack.Message}")
             .ToList();
+        var installKey = GetConfiguredKeyName(_installVoicePackUpdatesKeyEntry);
+        var action = installKey.Equals("None", StringComparison.OrdinalIgnoreCase)
+            ? "Run Install.bat to update."
+            : $"Press {installKey} to update now, or run Install.bat.";
         var messageSuffix = messages.Count == 0 ? "" : "\n\nWhat's new:\n" + string.Join("\n\n", messages);
 
         if (changedPacks.Count == 1)
         {
-            return $"Voice line update available: {changedPacks[0].DisplayName}. Run Install.bat.{messageSuffix}";
+            return $"Voice line update available: {changedPacks[0].DisplayName}. {action}{messageSuffix}";
         }
 
         if (changedPacks.Count <= 3)
         {
-            return $"Voice line updates available: {string.Join(", ", changedPacks.Select(pack => pack.DisplayName))}. Run Install.bat.{messageSuffix}";
+            return $"Voice line updates available: {string.Join(", ", changedPacks.Select(pack => pack.DisplayName))}. {action}{messageSuffix}";
         }
 
-        return $"Voice line updates available for {changedPacks.Count} packs. Run Install.bat.{messageSuffix}";
+        return $"Voice line updates available for {changedPacks.Count} packs. {action}{messageSuffix}";
     }
 
     internal static void PollVoicePackUpdateNotifications()
@@ -768,6 +807,7 @@ public class VoiceOverridePlugin : BasePlugin
             lock (_voicePackUpdateLock)
             {
                 _voicePackUpdateToastMessage = "";
+                _voicePackUpdatesAvailable = new List<VoicePackUpdateInfo>();
                 _nextVoicePackUpdateToastUtc = DateTime.MaxValue;
             }
         }
@@ -784,6 +824,633 @@ public class VoiceOverridePlugin : BasePlugin
         SaveConfig();
         WriteLog($"OPTION_VOICE_PACK_UPDATE_TOASTS {enabled} source={source}");
         ShowToast(enabled ? "Voice update toasts: ON" : "Voice update toasts: OFF");
+    }
+
+    private static void StartVoicePackUpdateInstall(string source)
+    {
+        lock (_voicePackInstallLock)
+        {
+            if (_voicePackInstallRunning)
+            {
+                ShowToast("Voice update already running.", 8f);
+                return;
+            }
+            _voicePackInstallRunning = true;
+        }
+
+        try
+        {
+            var thread = new System.Threading.Thread(() => RunVoicePackUpdateInstall(source))
+            {
+                IsBackground = true,
+                Name = "ZeroParadesVoicePackInstall",
+            };
+            thread.Start();
+            WriteLog($"VOICE_PACK_INSTALL_STARTED source={source}");
+        }
+        catch (Exception ex)
+        {
+            lock (_voicePackInstallLock) _voicePackInstallRunning = false;
+            WriteLog($"VOICE_PACK_INSTALL_START_FAIL {source}: {ex.GetType().Name}: {ex.Message}");
+            ShowToast($"Voice update failed to start: {ex.Message}", 12f);
+        }
+    }
+
+    private static void RunVoicePackUpdateInstall(string source)
+    {
+        var updatedPacks = new List<string>();
+        var changedShardCount = 0;
+        var downloadedShardCount = 0;
+        try
+        {
+            ShowToast("Checking voice line updates...", 8f);
+            var installedPacks = LoadInstalledVoicePackStates();
+            if (installedPacks.Count == 0)
+            {
+                WriteLog($"VOICE_PACK_INSTALL_STATE_EMPTY source={source}");
+                ShowToast("No installed voice-pack metadata found. Run Install.bat once.", 14f);
+                return;
+            }
+
+            foreach (var pack in installedPacks)
+            {
+                if (string.IsNullOrWhiteSpace(pack.UpdateUrl))
+                {
+                    WriteLog($"VOICE_PACK_INSTALL_SKIP_NO_URL {pack.Name}");
+                    continue;
+                }
+
+                ShowToast($"Checking {pack.DisplayName}...", 8f);
+                var manifest = DownloadVoicePackManifest(pack);
+                if (manifest == null)
+                {
+                    WriteLog($"VOICE_PACK_INSTALL_MANIFEST_UNAVAILABLE {pack.Name}");
+                    continue;
+                }
+
+                if (!IsVoicePackRemoteChanged(pack, manifest.Metadata) && VoicePackShardFilesCurrent(pack, manifest))
+                {
+                    WriteLog($"VOICE_PACK_INSTALL_CURRENT {pack.Name} version={manifest.Version}");
+                    continue;
+                }
+
+                var result = InstallVoicePackManifest(pack, manifest);
+                updatedPacks.Add(pack.DisplayName);
+                changedShardCount += result.ChangedShards;
+                downloadedShardCount += result.DownloadedShards;
+                WriteLog($"VOICE_PACK_INSTALL_PACK_DONE {pack.Name} changedShards={result.ChangedShards} downloadedShards={result.DownloadedShards} pruned={result.PrunedFiles} files={result.AudioFiles}");
+            }
+
+            if (updatedPacks.Count == 0)
+            {
+                lock (_voicePackUpdateLock)
+                {
+                    _voicePackUpdateToastMessage = "";
+                    _voicePackUpdatesAvailable = new List<VoicePackUpdateInfo>();
+                    _nextVoicePackUpdateToastUtc = DateTime.MaxValue;
+                    _lastVoicePackUpdateCheckUtc = DateTime.UtcNow;
+                }
+                ShowToast("Voice lines are already up to date.", 10f);
+                return;
+            }
+
+            LoadSilentCardIndex();
+            lock (_voicePackUpdateLock)
+            {
+                _voicePackUpdateToastMessage = "";
+                _voicePackUpdatesAvailable = new List<VoicePackUpdateInfo>();
+                _nextVoicePackUpdateToastUtc = DateTime.MaxValue;
+                _lastVoicePackUpdateCheckUtc = DateTime.UtcNow;
+            }
+
+            var packList = string.Join(", ", updatedPacks);
+            ShowToast($"Voice update installed.\nUpdated: {packList}\nShards changed: {changedShardCount}, downloaded: {downloadedShardCount}\nNew lines will be used immediately.", 18f);
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"VOICE_PACK_INSTALL_FAIL {source}: {ex.GetType().Name}: {ex.Message}");
+            WriteLog($"VOICE_PACK_INSTALL_FAIL_STACK {ex}");
+            ShowToast($"Voice update failed: {ex.GetType().Name}: {ex.Message}\nRun Install.bat if this keeps happening.", 18f);
+        }
+        finally
+        {
+            lock (_voicePackInstallLock) _voicePackInstallRunning = false;
+        }
+    }
+
+    private static VoicePackManifest? DownloadVoicePackManifest(InstalledVoicePackState pack)
+    {
+        System.Net.HttpWebResponse? response = null;
+        try
+        {
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(AddNoCacheQuery(pack.UpdateUrl));
+            request.Method = "GET";
+            request.UserAgent = "ZeroParadesVoiceOverride/0.3.21";
+            request.AllowAutoRedirect = true;
+            request.Timeout = 30000;
+            request.ReadWriteTimeout = 60000;
+            PrepareNoCacheRequest(request);
+            response = (System.Net.HttpWebResponse)request.GetResponse();
+            using var stream = response.GetResponseStream();
+            if (stream == null) return null;
+            using var reader = new StreamReader(stream);
+            var json = reader.ReadToEnd();
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var metadata = new RemoteVoicePackMetadata
+            {
+                Etag = response.Headers["ETag"] ?? "",
+                LastModified = response.LastModified > DateTime.MinValue ? response.LastModified.ToUniversalTime().ToString("o") : "",
+                ContentLength = response.ContentLength,
+                ManifestHash = GetJsonString(root, "manifestHash"),
+                ManifestVersion = GetJsonString(root, "version"),
+                UpdateMessage = GetJsonString(root, "updateMessage"),
+                FileCount = GetJsonInt64(root, "fileCount"),
+                ShardCount = GetJsonInt64(root, "shardCount"),
+                TotalBytes = GetJsonInt64(root, "totalBytes"),
+            };
+            var manifest = new VoicePackManifest
+            {
+                Name = GetJsonString(root, "pack"),
+                DisplayName = GetJsonString(root, "displayName"),
+                Destination = GetJsonString(root, "destination"),
+                Format = GetJsonString(root, "format"),
+                ManifestHash = metadata.ManifestHash,
+                Version = metadata.ManifestVersion,
+                UpdateMessage = metadata.UpdateMessage,
+                FileCount = metadata.FileCount,
+                ShardCount = metadata.ShardCount,
+                TotalBytes = metadata.TotalBytes,
+                ManifestUrl = pack.UpdateUrl,
+                Metadata = metadata,
+                RawJson = json,
+            };
+            if (string.IsNullOrWhiteSpace(manifest.Name)) manifest.Name = pack.Name;
+            if (string.IsNullOrWhiteSpace(manifest.DisplayName)) manifest.DisplayName = pack.DisplayName;
+            if (string.IsNullOrWhiteSpace(manifest.Destination)) manifest.Destination = pack.Destination;
+
+            if (root.TryGetProperty("shards", out var shardsElement) && shardsElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var shard in shardsElement.EnumerateArray())
+                {
+                    var shardInfo = new VoicePackShard
+                    {
+                        Name = GetJsonString(shard, "name"),
+                        Path = GetJsonString(shard, "path"),
+                        Url = GetJsonString(shard, "url"),
+                        Sha256 = GetJsonString(shard, "sha256"),
+                        Size = GetJsonInt64(shard, "size"),
+                        FileCount = GetJsonInt64(shard, "fileCount"),
+                    };
+                    if (string.IsNullOrWhiteSpace(shardInfo.Name)) continue;
+                    if (string.IsNullOrWhiteSpace(shardInfo.Url)) shardInfo.Url = JoinVoicePackRemotePath(pack.UpdateUrl, shardInfo.Path);
+                    manifest.Shards.Add(shardInfo);
+                }
+            }
+
+            if (root.TryGetProperty("files", out var filesElement) && filesElement.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var file in filesElement.EnumerateObject())
+                {
+                    if (file.Value.ValueKind != JsonValueKind.Object) continue;
+                    var relativePath = GetJsonString(file.Value, "path");
+                    var shardName = GetJsonString(file.Value, "shard");
+                    if (string.IsNullOrWhiteSpace(relativePath)) continue;
+                    manifest.ManagedRelativePaths.Add(NormalizeRelativePath(relativePath));
+                    if (!string.IsNullOrWhiteSpace(shardName))
+                    {
+                        if (!manifest.FilesByShard.TryGetValue(shardName, out var paths))
+                        {
+                            paths = new List<string>();
+                            manifest.FilesByShard[shardName] = paths;
+                        }
+                        paths.Add(relativePath);
+                    }
+                }
+            }
+
+            return manifest;
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"VOICE_PACK_INSTALL_MANIFEST_FAIL {pack.Name}: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+        finally
+        {
+            try { response?.Dispose(); } catch { }
+        }
+    }
+
+    private static VoicePackInstallResult InstallVoicePackManifest(InstalledVoicePackState pack, VoicePackManifest manifest)
+    {
+        if (!string.Equals(manifest.Format, "sharded-zip", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"Voice pack '{pack.Name}' manifest format is '{manifest.Format}', expected sharded-zip.");
+        }
+
+        var destination = ResolveGameRelativePath(!string.IsNullOrWhiteSpace(manifest.Destination) ? manifest.Destination : pack.Destination);
+        if (string.IsNullOrWhiteSpace(destination)) throw new InvalidOperationException($"Voice pack '{pack.Name}' has no destination.");
+        Directory.CreateDirectory(destination);
+
+        var safeName = SafeFileName(pack.Name);
+        var downloadRoot = Path.Combine(GetGameRootPath(), "_voicepack-downloads", safeName);
+        Directory.CreateDirectory(downloadRoot);
+        var changedItems = new List<VoicePackShardInstallItem>();
+
+        foreach (var shard in manifest.Shards)
+        {
+            var installedSha = pack.ShardSha256.TryGetValue(shard.Name, out var oldSha) ? oldSha : "";
+            var alreadyInstalled = !string.IsNullOrWhiteSpace(installedSha)
+                && string.Equals(installedSha, shard.Sha256, StringComparison.OrdinalIgnoreCase)
+                && ShardFilesPresent(destination, manifest, shard.Name);
+            if (alreadyInstalled) continue;
+
+            var archive = Path.Combine(downloadRoot, shard.Name);
+            var archiveOk = File.Exists(archive)
+                && !string.IsNullOrWhiteSpace(shard.Sha256)
+                && string.Equals(Sha256File(archive), shard.Sha256, StringComparison.OrdinalIgnoreCase);
+            changedItems.Add(new VoicePackShardInstallItem
+            {
+                Shard = shard,
+                Archive = archive,
+                NeedsDownload = !archiveOk,
+            });
+        }
+
+        var changedShards = changedItems.Count;
+        var downloadedShards = 0;
+        if (changedItems.Count > 0)
+        {
+            var downloadItems = changedItems.Where(item => item.NeedsDownload).ToList();
+            var downloadWorkers = GetVoicePackDownloadParallelism();
+            var extractWorkers = GetVoicePackExtractParallelism();
+            WriteLog($"VOICE_PACK_INSTALL_PLAN {pack.Name} changedShards={changedItems.Count} downloads={downloadItems.Count} downloadWorkers={downloadWorkers} extractWorkers={extractWorkers}");
+
+            if (downloadItems.Count > 0)
+            {
+                var downloaded = 0;
+                ShowToast($"Downloading voice update...\n{pack.DisplayName}\n0 / {downloadItems.Count} shards", 12f);
+                try
+                {
+                    System.Threading.Tasks.Parallel.ForEach(downloadItems, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = downloadWorkers }, item =>
+                    {
+                        ShowToast($"Downloading voice update...\n{pack.DisplayName}\n{item.Shard.Name}", 10f);
+                        DownloadFileToPath(item.Shard.Url, item.Archive, $"{pack.DisplayName} {item.Shard.Name}");
+                        var done = System.Threading.Interlocked.Increment(ref downloaded);
+                        ShowToast($"Downloading voice update...\n{pack.DisplayName}\n{done} / {downloadItems.Count} shards", 10f);
+                    });
+                }
+                catch (AggregateException ex)
+                {
+                    throw ex.Flatten().InnerExceptions.FirstOrDefault() ?? ex;
+                }
+                downloadedShards = downloaded;
+            }
+
+            foreach (var item in changedItems)
+            {
+                var shard = item.Shard;
+                if (!string.IsNullOrWhiteSpace(shard.Sha256))
+                {
+                    var actualSha = Sha256File(item.Archive);
+                    if (!string.Equals(actualSha, shard.Sha256, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException($"Voice pack '{pack.Name}' shard '{shard.Name}' hash mismatch.");
+                    }
+                }
+            }
+
+            StopOverridePlaybackFromGame("VOICE_PACK_UPDATE");
+            var extracted = 0;
+            ShowToast($"Installing voice update...\n{pack.DisplayName}\n0 / {changedItems.Count} shards", 12f);
+            try
+            {
+                System.Threading.Tasks.Parallel.ForEach(changedItems, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = extractWorkers }, item =>
+                {
+                    ExtractZipToDirectory(item.Archive, destination);
+                    var done = System.Threading.Interlocked.Increment(ref extracted);
+                    ShowToast($"Installing voice update...\n{pack.DisplayName}\n{done} / {changedItems.Count} shards", 10f);
+                });
+            }
+            catch (AggregateException ex)
+            {
+                throw ex.Flatten().InnerExceptions.FirstOrDefault() ?? ex;
+            }
+        }
+
+        var pruned = PruneVoicePackFiles(destination, manifest);
+        var manifestPath = Path.Combine(destination, "_voice-pack-manifest.json");
+        File.WriteAllText(manifestPath, manifest.RawJson, System.Text.Encoding.UTF8);
+        var audioFiles = CountAudioFiles(destination);
+        WriteVoicePackState(pack, manifest, audioFiles);
+        return new VoicePackInstallResult
+        {
+            ChangedShards = changedShards,
+            DownloadedShards = downloadedShards,
+            PrunedFiles = pruned,
+            AudioFiles = audioFiles,
+        };
+    }
+
+    private static int GetVoicePackDownloadParallelism()
+    {
+        return Math.Max(1, Math.Min(6, Environment.ProcessorCount));
+    }
+
+    private static int GetVoicePackExtractParallelism()
+    {
+        return Math.Max(1, Math.Min(4, Math.Max(1, Environment.ProcessorCount / 2)));
+    }
+
+    private static bool VoicePackShardFilesCurrent(InstalledVoicePackState pack, VoicePackManifest manifest)
+    {
+        var destination = ResolveGameRelativePath(!string.IsNullOrWhiteSpace(manifest.Destination) ? manifest.Destination : pack.Destination);
+        if (string.IsNullOrWhiteSpace(destination) || !Directory.Exists(destination)) return false;
+        foreach (var shard in manifest.Shards)
+        {
+            if (!pack.ShardSha256.TryGetValue(shard.Name, out var installedSha)
+                || !string.Equals(installedSha, shard.Sha256, StringComparison.OrdinalIgnoreCase)
+                || !ShardFilesPresent(destination, manifest, shard.Name))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool ShardFilesPresent(string destination, VoicePackManifest manifest, string shardName)
+    {
+        if (!manifest.FilesByShard.TryGetValue(shardName, out var paths)) return false;
+        foreach (var relativePath in paths)
+        {
+            var fullPath = SafeCombineUnderRoot(destination, relativePath);
+            if (fullPath == null || !File.Exists(fullPath)) return false;
+        }
+        return true;
+    }
+
+    private static void DownloadFileToPath(string url, string destination, string displayName)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(destination) ?? ".");
+        var tempPath = destination + ".tmp";
+        System.Net.HttpWebResponse? response = null;
+        try
+        {
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(AddNoCacheQuery(url));
+            request.Method = "GET";
+            request.UserAgent = "ZeroParadesVoiceOverride/0.3.21";
+            request.AllowAutoRedirect = true;
+            request.Timeout = 30000;
+            request.ReadWriteTimeout = 60000;
+            PrepareNoCacheRequest(request);
+            response = (System.Net.HttpWebResponse)request.GetResponse();
+            var total = response.ContentLength;
+            using (var input = response.GetResponseStream())
+            {
+                if (input == null) throw new IOException("No response stream.");
+                using (var output = File.Create(tempPath))
+                {
+                    var buffer = new byte[1024 * 1024];
+                    long copied = 0;
+                    var lastToast = DateTime.UtcNow;
+                    while (true)
+                    {
+                        var read = input.Read(buffer, 0, buffer.Length);
+                        if (read <= 0) break;
+                        output.Write(buffer, 0, read);
+                        copied += read;
+                        if ((DateTime.UtcNow - lastToast).TotalSeconds >= 4)
+                        {
+                            lastToast = DateTime.UtcNow;
+                            var status = total > 0
+                                ? $"{FormatBytes(copied)} / {FormatBytes(total)}"
+                                : FormatBytes(copied);
+                            ShowToast($"Downloading voice update...\n{displayName}\n{status}", 10f);
+                        }
+                    }
+                    output.Flush();
+                }
+            }
+            MoveFileIntoPlace(tempPath, destination);
+        }
+        finally
+        {
+            try { response?.Dispose(); } catch { }
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+        }
+    }
+
+    private static void MoveFileIntoPlace(string tempPath, string destination)
+    {
+        IOException? lastError = null;
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                if (File.Exists(destination)) File.Delete(destination);
+                File.Move(tempPath, destination);
+                return;
+            }
+            catch (IOException ex) when (attempt < 4)
+            {
+                lastError = ex;
+                System.Threading.Thread.Sleep(250 * (attempt + 1));
+            }
+        }
+        throw lastError ?? new IOException($"Failed to move downloaded file into place: {destination}");
+    }
+
+    private static void ExtractZipToDirectory(string archive, string destination)
+    {
+        var root = Path.GetFullPath(destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        using var zip = ZipFile.OpenRead(archive);
+        foreach (var entry in zip.Entries)
+        {
+            if (string.IsNullOrWhiteSpace(entry.FullName) || entry.FullName.EndsWith("/", StringComparison.Ordinal)) continue;
+            var target = Path.GetFullPath(Path.Combine(destination, entry.FullName));
+            if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new IOException($"Unsafe zip entry path: {entry.FullName}");
+            }
+            Directory.CreateDirectory(Path.GetDirectoryName(target) ?? destination);
+            entry.ExtractToFile(target, overwrite: true);
+        }
+    }
+
+    private static int PruneVoicePackFiles(string destination, VoicePackManifest manifest)
+    {
+        if (!Directory.Exists(destination) || manifest.ManagedRelativePaths.Count == 0) return 0;
+        var root = Path.GetFullPath(destination).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var removed = 0;
+        foreach (var file in Directory.EnumerateFiles(destination, "*", SearchOption.AllDirectories).ToArray())
+        {
+            var ext = Path.GetExtension(file);
+            var name = Path.GetFileName(file);
+            var managed = ext.Equals(".wav", StringComparison.OrdinalIgnoreCase)
+                || ext.Equals(".ogg", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("_silent-card-ids.txt", StringComparison.OrdinalIgnoreCase);
+            if (!managed) continue;
+            var relative = NormalizeRelativePath(file.Substring(root.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            if (manifest.ManagedRelativePaths.Contains(relative)) continue;
+            try
+            {
+                File.Delete(file);
+                removed++;
+            }
+            catch (Exception ex)
+            {
+                WriteLog($"VOICE_PACK_PRUNE_FAIL {file}: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+        return removed;
+    }
+
+    private static void WriteVoicePackState(InstalledVoicePackState pack, VoicePackManifest manifest, int audioFiles)
+    {
+        var statePath = Path.Combine(Paths.BepInExRootPath, "config", "spore.zeroparades.voicepacks.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(statePath) ?? ".");
+        JsonObject root;
+        try
+        {
+            root = File.Exists(statePath)
+                ? (JsonNode.Parse(File.ReadAllText(statePath)) as JsonObject ?? new JsonObject())
+                : new JsonObject();
+        }
+        catch
+        {
+            root = new JsonObject();
+        }
+
+        root["schemaVersion"] = 1;
+        root["updatedAt"] = DateTime.UtcNow.ToString("O");
+        var packs = root["packs"] as JsonObject;
+        if (packs == null)
+        {
+            packs = new JsonObject();
+            root["packs"] = packs;
+        }
+
+        var shardState = new JsonObject();
+        foreach (var shard in manifest.Shards.OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            shardState[shard.Name] = new JsonObject
+            {
+                ["name"] = shard.Name,
+                ["path"] = shard.Path,
+                ["url"] = shard.Url,
+                ["sha256"] = shard.Sha256,
+                ["size"] = shard.Size,
+                ["fileCount"] = shard.FileCount,
+                ["installedAt"] = DateTime.UtcNow.ToString("O"),
+            };
+        }
+
+        packs[pack.Name] = new JsonObject
+        {
+            ["name"] = pack.Name,
+            ["displayName"] = string.IsNullOrWhiteSpace(manifest.DisplayName) ? pack.DisplayName : manifest.DisplayName,
+            ["destination"] = string.IsNullOrWhiteSpace(manifest.Destination) ? pack.Destination : manifest.Destination,
+            ["format"] = "sharded-zip",
+            ["url"] = pack.PackageUrl,
+            ["manifestUrl"] = pack.UpdateUrl,
+            ["updateUrl"] = pack.UpdateUrl,
+            ["manifestHash"] = manifest.ManifestHash,
+            ["manifestVersion"] = manifest.Version,
+            ["installedAt"] = DateTime.UtcNow.ToString("O"),
+            ["etag"] = manifest.Metadata.Etag,
+            ["lastModified"] = manifest.Metadata.LastModified,
+            ["contentLength"] = manifest.Metadata.ContentLength,
+            ["downloadedBytes"] = manifest.Metadata.ContentLength,
+            ["fileCount"] = manifest.FileCount,
+            ["shardCount"] = manifest.ShardCount,
+            ["totalBytes"] = manifest.TotalBytes,
+            ["wavCount"] = audioFiles,
+            ["renamedCount"] = 0,
+            ["shards"] = shardState,
+        };
+
+        File.WriteAllText(statePath, root.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), System.Text.Encoding.UTF8);
+    }
+
+    private static string JoinVoicePackRemotePath(string manifestUrl, string shardPath)
+    {
+        if (string.IsNullOrWhiteSpace(shardPath)) return "";
+        if (shardPath.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            || shardPath.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return shardPath;
+        }
+
+        var baseUrl = manifestUrl;
+        var query = baseUrl.IndexOf('?');
+        if (query >= 0) baseUrl = baseUrl.Substring(0, query);
+        var marker = baseUrl.IndexOf("/manifests/", StringComparison.OrdinalIgnoreCase);
+        if (marker >= 0)
+        {
+            baseUrl = baseUrl.Substring(0, marker);
+        }
+        else
+        {
+            var slash = baseUrl.LastIndexOf('/');
+            if (slash >= 0) baseUrl = baseUrl.Substring(0, slash);
+        }
+        return baseUrl.TrimEnd('/') + "/" + shardPath.Replace("\\", "/").TrimStart('/');
+    }
+
+    private static string ResolveGameRelativePath(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return "";
+        return Path.IsPathRooted(value) ? value : Path.Combine(GetGameRootPath(), value.Replace('/', Path.DirectorySeparatorChar));
+    }
+
+    private static string? SafeCombineUnderRoot(string rootPath, string relativePath)
+    {
+        try
+        {
+            var root = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            var full = Path.GetFullPath(Path.Combine(rootPath, relativePath));
+            return full.StartsWith(root, StringComparison.OrdinalIgnoreCase) ? full : null;
+        }
+        catch { return null; }
+    }
+
+    private static string NormalizeRelativePath(string value)
+    {
+        return value.Replace('\\', '/').TrimStart('/').ToLowerInvariant();
+    }
+
+    private static string SafeFileName(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var chars = (value ?? "").Select(ch => invalid.Contains(ch) ? '_' : ch).ToArray();
+        var safe = new string(chars).Trim('.', ' ', '_');
+        return string.IsNullOrWhiteSpace(safe) ? "pack" : safe;
+    }
+
+    private static string Sha256File(string path)
+    {
+        using var stream = File.OpenRead(path);
+        using var sha = SHA256.Create();
+        var hash = sha.ComputeHash(stream);
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+    }
+
+    private static int CountAudioFiles(string root)
+    {
+        if (!Directory.Exists(root)) return 0;
+        return Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+            .Count(path =>
+                Path.GetExtension(path).Equals(".wav", StringComparison.OrdinalIgnoreCase)
+                || Path.GetExtension(path).Equals(".ogg", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes >= 1024L * 1024L * 1024L) return $"{bytes / (1024d * 1024d * 1024d):0.0} GB";
+        if (bytes >= 1024L * 1024L) return $"{bytes / (1024d * 1024d):0.0} MB";
+        if (bytes >= 1024L) return $"{bytes / 1024d:0.0} KB";
+        return $"{bytes} B";
     }
 
     private static Type? FindType(string fullName)
@@ -1314,6 +1981,32 @@ public class VoiceOverridePlugin : BasePlugin
         return FindOverrideFile(id, EnumerateOverrideRoots());
     }
 
+    private static string? FindAuxiliaryOverrideFile(string id, out string source)
+    {
+        source = "";
+        if (NarratorMissingVoicesEnabled && !string.IsNullOrWhiteSpace(NarratorOverrideRoot))
+        {
+            var narrator = FindOverrideFile(id, new[] { NarratorOverrideRoot });
+            if (narrator != null)
+            {
+                source = "narrator";
+                return narrator;
+            }
+        }
+
+        if (ExtraVoicesEnabled && !string.IsNullOrWhiteSpace(ExtraOverrideRoot))
+        {
+            var extra = FindOverrideFile(id, new[] { ExtraOverrideRoot });
+            if (extra != null)
+            {
+                source = "extras";
+                return extra;
+            }
+        }
+
+        return null;
+    }
+
     private static string? FindMissingVoiceFile(string id, out string source)
     {
         source = "";
@@ -1464,6 +2157,35 @@ public class VoiceOverridePlugin : BasePlugin
         {
             WriteLog($"{source} OVERRIDE_DISABLED_ALLOW_ORIGINAL {id}");
             return true;
+        }
+
+        var auxiliaryFile = FindAuxiliaryOverrideFile(id, out var auxiliarySource);
+        if (auxiliaryFile != null)
+        {
+            var auxiliaryNow = DateTime.UtcNow;
+            if (_recentImmediateOverridesUtc.TryGetValue(id, out var auxiliaryRecentImmediateUtc)
+                && (auxiliaryNow - auxiliaryRecentImmediateUtc).TotalMilliseconds < ImmediateDuplicateSuppressMs)
+            {
+                _recentImmediateOverridesUtc[id] = auxiliaryNow;
+                WriteLog($"{source} DUPLICATE_SUPPRESS {id}");
+                return OriginalVoiceEnabledForOverrides;
+            }
+
+            WriteLog($"{source} PLAY_AUX_OVERRIDE {id} source={auxiliarySource} {auxiliaryFile}");
+            if (PlayExternal(auxiliaryFile, id))
+            {
+                MarkImmediateOverride(id);
+                ShowDebugToast($"{auxiliarySource} VO: {id}");
+                WriteLog(OriginalVoiceEnabledForOverrides
+                    ? $"{source} ALLOW_ORIGINAL {id}"
+                    : $"{source} SKIP_ORIGINAL {id}");
+                WriteLiveFixPlaybackEvent(source, id, auxiliarySource, auxiliaryFile, !OriginalVoiceEnabledForOverrides);
+                return OriginalVoiceEnabledForOverrides;
+            }
+            WriteLog(AllowOriginalOnOverrideFailure
+                ? $"{source} AUX_OVERRIDE_FAILED_ALLOW_ORIGINAL {id}"
+                : $"{source} AUX_OVERRIDE_FAILED_SKIP_ORIGINAL {id}");
+            return AllowOriginalOnOverrideFailure || OriginalVoiceEnabledForOverrides;
         }
 
         if (!IsRedubEnabled())
@@ -1634,6 +2356,11 @@ public class VoiceOverridePlugin : BasePlugin
         if (WasKeyPressed(_toggleVoicePackUpdateToastsKeyEntry))
         {
             SetVoicePackUpdateToastsEnabled(!VoicePackUpdateToastsEnabled, "HOTKEY");
+        }
+
+        if (WasKeyPressed(_installVoicePackUpdatesKeyEntry))
+        {
+            StartVoicePackUpdateInstall("HOTKEY");
         }
 
         if (WasKeyPressed(_reportLatestDialogueKeyEntry))
@@ -2472,12 +3199,16 @@ public class VoiceOverridePlugin : BasePlugin
   {
       public string Name = "";
       public string DisplayName = "";
+      public string Destination = "";
+      public string Format = "";
+      public string PackageUrl = "";
       public string UpdateUrl = "";
       public string Etag = "";
       public string LastModified = "";
       public long ContentLength = -1;
       public string ManifestHash = "";
       public string ManifestVersion = "";
+      public Dictionary<string, string> ShardSha256 = new(StringComparer.OrdinalIgnoreCase);
   }
 
   private sealed class RemoteVoicePackMetadata
@@ -2498,6 +3229,51 @@ public class VoiceOverridePlugin : BasePlugin
       public string Name = "";
       public string DisplayName = "";
       public string Message = "";
+  }
+
+  private sealed class VoicePackManifest
+  {
+      public string Name = "";
+      public string DisplayName = "";
+      public string Destination = "";
+      public string Format = "";
+      public string ManifestHash = "";
+      public string Version = "";
+      public string UpdateMessage = "";
+      public string ManifestUrl = "";
+      public long FileCount = -1;
+      public long ShardCount = -1;
+      public long TotalBytes = -1;
+      public string RawJson = "";
+      public RemoteVoicePackMetadata Metadata = new();
+      public List<VoicePackShard> Shards = new();
+      public Dictionary<string, List<string>> FilesByShard = new(StringComparer.OrdinalIgnoreCase);
+      public HashSet<string> ManagedRelativePaths = new(StringComparer.OrdinalIgnoreCase);
+  }
+
+  private sealed class VoicePackShard
+  {
+      public string Name = "";
+      public string Path = "";
+      public string Url = "";
+      public string Sha256 = "";
+      public long Size = -1;
+      public long FileCount = -1;
+  }
+
+  private sealed class VoicePackShardInstallItem
+  {
+      public VoicePackShard Shard = new();
+      public string Archive = "";
+      public bool NeedsDownload;
+  }
+
+  private sealed class VoicePackInstallResult
+  {
+      public int ChangedShards;
+      public int DownloadedShards;
+      public int PrunedFiles;
+      public int AudioFiles;
   }
 }
 

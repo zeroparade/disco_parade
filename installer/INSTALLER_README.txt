@@ -14,6 +14,7 @@ F1 cycles presets: original game VO, original + missing VO, male redub, female r
 F2 cycles redub profile: off, male, female.
 F3 toggles extra-character missing VO.
 F4 toggles narrator-only missing VO.
+F9 downloads and installs available voice-pack updates while the game is running.
 F10 shows the latest captured dialogue report and writes ZERO_PARADES_latest_dialogue_report.txt in the game folder for sharing.
 F11 toggles recurring voice-pack update toasts.
 F12 toggles debug toasts for played override VO and generated missing VO.
@@ -22,5 +23,6 @@ Notes:
 The ZIP does not bundle BepInEx itself.
 The installer hides the BepInEx console window but keeps disk logging enabled.
 The installer window stays visible and shows download progress.
-You can rerun Install.bat later to add voice packs you skipped or update packs. Manifest-based packs download only missing or changed shards.
+You can rerun Install.bat later to add voice packs you skipped.
+To update only the packs already installed, run Install.bat update. Manifest-based packs download only missing or changed shards.
 Voice pack install/update metadata is saved in BepInEx/config/spore.zeroparades.voicepacks.json.

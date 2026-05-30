@@ -64,11 +64,31 @@ To generate sharded voice packs from an installed game folder:
 python .\tools\build_voice_pack_shards.py --game-root "<path-to-game-folder>" --output "<output-folder>" --base-url "https://huggingface.co/datasets/zeroparade/dead_disco/resolve/main"
 ```
 
+To build and publish to Hugging Face in one step:
+
+```powershell
+$env:HF_TOKEN = "<your Hugging Face token>"
+python .\tools\build_voice_pack_shards.py `
+  --game-root "Q:\Games\ZERO PARADES For Dead Spies" `
+  --output "Q:\Games\ZERO PARADES For Dead Spies\voice_packs" `
+  --upload
+```
+
 Use `--clean` only when you intentionally want to discard the local generated pack tree and rebuild it. For normal updates, omit `--clean`; the generator reads the previous manifests, reuses unchanged shard zips, writes only changed/new shards, and prunes stale shard zips. Shard filenames are stable (`male-b000-p00.zip`, etc.) so publishing updates overwrites the same remote paths. Content hashes are stored in the manifests. Files are assigned to stable dialogue-id hash buckets, so normal line additions or replacements only invalidate the affected bucket shard instead of reshuffling the whole pack.
 
 The builder hashes files and writes changed shard ZIPs in parallel. It defaults to up to 8 workers; use `--workers 4` or `--workers 12` to tune for your CPU/disk.
 
 After each build, `publish-changes.txt` lists the relative files that changed in the generated pack tree. Use that list when copying into the Hugging Face repository; a male-only update should normally include `manifests/male.json`, `manifest-index.json`, and only the changed `packs/male/shards/*.zip` files.
+
+If you rerun the builder after generating local changes, `publish-changes.txt` can correctly say `No files changed` because the local output is already up to date. The builder also writes `publish-changes-remote.txt` by default for the live Hugging Face repo:
+
+```powershell
+python tools\build_voice_pack_shards.py `
+  --game-root "Q:\Games\ZERO PARADES For Dead Spies" `
+  --output "Q:\Games\ZERO PARADES For Dead Spies\voice_packs"
+```
+
+That remote list compares local manifests against the remote manifests and includes required `DELETE ...` lines for stale shard zips. To compare against a different remote, pass `--compare-remote-base-url`; to skip the network check, pass `--compare-remote-base-url ""`.
 
 To show release notes in the in-game update toast, pass a per-pack message while building:
 
@@ -84,10 +104,11 @@ You can repeat `-c`, for example `-c "male=..." -c "extras=..."`. For longer not
 - `F2`: cycle redub profile: off, male, female
 - `F3`: toggle extra-character missing VO
 - `F4`: toggle narrator-only missing VO
+- `F9`: download and install available voice-pack updates while the game is running
 - `F10`: show the latest captured dialogue report and write `ZERO_PARADES_latest_dialogue_report.txt` in the game folder for sharing
 - `F11`: toggle recurring voice-pack update toasts
 - `F12`: toggle debug toasts for played override VO and generated missing VO
 
 The extras and narrator folders are not F2 profiles. Existing game VO is replaced only by the active male/female redub profile. Missing/silent dialogue searches `voice-override-narrator` first when enabled, then `voice-override-extras`, then the active redub profile for cards listed in a silent-card index.
 
-At game launch, the plugin reads `BepInEx/config/spore.zeroparades.voicepacks.json` and checks tracked voice pack URLs on a background thread. For sharded packs it compares the installed `manifestHash` against the remote manifest. If remote metadata has changed, it shows a bottom-screen update toast and repeats it every `VoicePackUpdateToastRepeatMinutes` while update toasts are enabled.
+At game launch, the plugin reads `BepInEx/config/spore.zeroparades.voicepacks.json` and checks tracked voice pack URLs on a background thread. For sharded packs it compares the installed `manifestHash` against the remote manifest. If remote metadata has changed, it shows a bottom-screen update toast and repeats it every `VoicePackUpdateToastRepeatMinutes` while update toasts are enabled. Press `F9` while the toast is active to download only changed shards, install them in place, prune obsolete managed audio, and update the local pack state without leaving the game.
